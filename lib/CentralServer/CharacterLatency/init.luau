@@ -1,6 +1,6 @@
+--!strict
 local PhysicsService = game:GetService("PhysicsService")
 local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
 local Settings = require(script.Parent.Parent.Settings)
 
 local CharacterLatency = {}
@@ -22,10 +22,10 @@ function CharacterLatency.Start()
 	local Folder = script:WaitForChild("CharacterLatency")
 
 	local Platform = Folder:WaitForChild("Platform")
-	local PlatformPart = Platform:WaitForChild("Part")
-	local Part1 = Platform:WaitForChild("Part1")
-	local Part2 = Platform:WaitForChild("Part2")
-	local Remote = Folder:WaitForChild("CharacterLatencyRemote")
+	local PlatformPart = Platform:WaitForChild("Part") :: Part
+	local Part1 = Platform:WaitForChild("Part1") :: Part
+	local Part2 = Platform:WaitForChild("Part2") :: Part
+	local Remote = Folder:WaitForChild("CharacterLatencyRemote") :: RemoteEvent
 
 	local Dummy = Folder:WaitForChild("LatencyDummy")
 	Dummy:SetAttribute("Count", 1)
@@ -37,7 +37,7 @@ function CharacterLatency.Start()
 	local humanoid = Dummy:WaitForChild("Humanoid") :: Humanoid
 	local root = humanoid.RootPart :: Part
 
-	local delta = Vector3.new(0,13337,0)
+	local delta = Settings.LATENCY_DUMMY_HIDE_OFFSET
 	PlatformPart.CFrame += delta
 	Part1.CFrame += delta
 	Part2.CFrame += delta
@@ -50,14 +50,13 @@ function CharacterLatency.Start()
 	PhysicsService:CollisionGroupSetCollidable("LatencyDummy", "LatencyDummy", true)
 
 	local LATENCY_MULTIPLIER = Settings.LATENCY_MULTIPLIER
+	local MAX_LATENCY = Settings.MAX_LATENCY
 
 	local atStart = true
 
-	local MAX_SERVER_STAMPS = 3
-	local MAX_AVERAGE_SAMPLES = 1
+	local MAX_SERVER_STAMPS = Settings.LATENCY_STAMP_HISTORY
 
 	local CountTimes = {} :: {[number]: number}
-	local PlayerLatencies = {} :: {[Player]: {number}}
 
 	local position1 = Part1.Position
 	local position2 = Part2.Position
@@ -104,7 +103,7 @@ function CharacterLatency.Start()
 		end
 	end)
 
-	local DT = 0.5
+	local DT = Settings.LATENCY_DUMMY_STEP_INTERVAL
 
 	task.defer(function()
 		while true do
@@ -126,44 +125,26 @@ function CharacterLatency.Start()
 	end)
 
 	Remote.OnServerEvent:Connect(function(player: Player, count: number, t: number)
+		if typeof(count) ~= "number" or typeof(t) ~= "number" then
+			warn("Invalid latency stamp payload from player: " .. player.Name)
+			return
+		end
+
 		if not CountTimes[count] then
 			warn("Latency stamp expired or invalid for count: " .. tostring(count))
 			return
 
 		end
 
-		local currentLatency = t - CountTimes[count]
-
-		if not PlayerLatencies[player] then
-			PlayerLatencies[player] = {}
+		local now = workspace:GetServerTimeNow()
+		if t > now then
+			warn("Latency stamp from the future for player: " .. player.Name)
+			return
 		end
 
-		local history = PlayerLatencies[player]
+		local currentLatency = math.clamp(t - CountTimes[count], 0, MAX_LATENCY)
 
-		table.insert(history, currentLatency)
-
-		if #history > MAX_AVERAGE_SAMPLES then
-			table.remove(history, 1)
-		end
-
-		local sum = 0
-		for _, sample in ipairs(history) do
-			sum += sample
-		end
-		local averageLatency = sum / #history
-
-		local remoteLatency = workspace:GetServerTimeNow() - t
-		local networkLatency = player:GetNetworkPing()/2
-
-
-		player:SetAttribute(LATENCY_ATTRIBUTE, averageLatency*LATENCY_MULTIPLIER)
-		--player:SetAttribute("RemoteLatency", remoteLatency)
-		--player:SetAttribute("Latency", networkLatency)
-
-	end)
-
-	Players.PlayerRemoving:Connect(function(player)
-		PlayerLatencies[player] = nil
+		player:SetAttribute(LATENCY_ATTRIBUTE, currentLatency * LATENCY_MULTIPLIER)
 	end)
 end
 

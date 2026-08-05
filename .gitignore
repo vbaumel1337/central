@@ -2,5 +2,5 @@ Packages/
 wally.lock
 *.rbxlx
 *.rbxl
-selene.toml
 !examples/*.rbxl
+globalTypes.d.luau

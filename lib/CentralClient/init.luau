@@ -1,3 +1,4 @@
+--!strict
 local RunService = game:GetService("RunService")
 
 local Settings = require(script.Parent.Settings)
@@ -29,8 +30,8 @@ function CentralClient.Start()
 	local root = Dummy:WaitForChild("HumanoidRootPart") :: Part
 
 	local Platform = Folder:WaitForChild("Platform")
-	local Part1 = Platform:WaitForChild("Part1")
-	local Part2 = Platform:WaitForChild("Part2")
+	local Part1 = Platform:WaitForChild("Part1") :: Part
+	local Part2 = Platform:WaitForChild("Part2") :: Part
 
 	task.wait(4.125)
 

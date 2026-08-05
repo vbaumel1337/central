@@ -1,4 +1,6 @@
+--!native
 --!strict
+--!optimize 2
 local PhysicsService = game:GetService("PhysicsService")
 
 local bolt = require(script.Parent.Parent.bolt)
@@ -9,7 +11,7 @@ local gjk = bolt.dispatch.gjk
 local collision = bolt.collision
 local shapeMap = bolt.shape_map
 
-local GJK_TOLERANCE = 1e-4
+local GJK_TOLERANCE = Settings.GJK_TOLERANCE
 
 export type Hitbox = {
 	id: number,
@@ -24,7 +26,7 @@ export type Hitbox = {
 	active: boolean,
 }
 
-type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister}
+type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number}
 
 local HistoricalHitboxes = {}
 HistoricalHitboxes.__index = HistoricalHitboxes
@@ -36,6 +38,7 @@ export type HistoricalHitboxes = typeof(setmetatable(
 		trees: {[number]: bolt.DynamicTree},
 		hitboxes: {[number]: {[number]: Hitbox}},
 		parts: {[BasePart]: PartInfo},
+		partList: {PartInfo},
 		nextPartId: number,
 		AddPart: (self: any, register: PartRegister.PartRegister) -> (),
 		RemovePart: (self: any, part: BasePart) -> (),
@@ -98,6 +101,7 @@ function HistoricalHitboxes.new(frameCap: number, padding: number): HistoricalHi
 	self.trees = {}
 	self.hitboxes = {}
 	self.parts = {}
+	self.partList = {}
 	self.nextPartId = 0
 
 	for index = 1, frameCap do
@@ -115,7 +119,9 @@ function HistoricalHitboxes.AddPart(self: HistoricalHitboxes, register: PartRegi
 	end
 
 	self.nextPartId += 1
-	self.parts[part] = {id = self.nextPartId, part = part, register = register}
+	local info: PartInfo = {id = self.nextPartId, part = part, register = register, listIndex = #self.partList + 1}
+	self.parts[part] = info
+	table.insert(self.partList, info)
 end
 
 function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
@@ -132,6 +138,15 @@ function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
 		end
 	end
 
+	local lastIndex = #self.partList
+	local listIndex = info.listIndex
+	if listIndex ~= lastIndex then
+		local lastInfo = self.partList[lastIndex]
+		self.partList[listIndex] = lastInfo
+		lastInfo.listIndex = listIndex
+	end
+	self.partList[lastIndex] = nil
+
 	self.parts[part] = nil
 end
 
@@ -139,7 +154,8 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 	local tree = self.trees[index]
 	local frameHitboxes = self.hitboxes[index]
 
-	for _, info in self.parts do
+	for _, info in self.partList do
+		info.register:Step()
 		local data = info.register:AtIndex(index)
 		local hitbox = frameHitboxes[info.id]
 		if not data.cframe then
@@ -331,7 +347,7 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 			end
 
 			if not previous or math.abs(offset) < math.abs(previous.frameOffset) then
-				local resultHitbox = hitbox
+				local resultHitbox = table.clone(hitbox)
 				resultHitbox.frameOffset = offset
 				results[hitbox.instance] = resultHitbox
 			end
@@ -346,6 +362,7 @@ function HistoricalHitboxes.Destroy(self: HistoricalHitboxes)
 		table.clear(self.hitboxes[index])
 	end
 	table.clear(self.parts)
+	table.clear(self.partList)
 end
 
 return HistoricalHitboxes

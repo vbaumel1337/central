@@ -1,4 +1,6 @@
+--!native
 --!strict
+--!optimize 2
 local Settings = require(script.Parent.Parent.Parent.Settings)
 local Observers = require(script.Parent.Parent.Parent.Parent.Observers)
 local FrameRegister = require(script.Parent.FrameRegister)

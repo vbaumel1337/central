@@ -1,4 +1,6 @@
+--!native
 --!strict
+--!optimize 2
 local FrameRegister = {}
 FrameRegister.__index = FrameRegister
 

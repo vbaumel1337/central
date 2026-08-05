@@ -1,3 +1,4 @@
+--!strict
 local RunService = game:GetService("RunService")
 
 local isClient = RunService:IsClient()
@@ -17,7 +18,7 @@ local bolt = require(script.bolt)
 local visualizer = require(script.visualizer)
 local Settings = require(script.Settings)
 
-local RAYCAST_MARGIN = 1e-4
+local RAYCAST_MARGIN = Settings.RAYCAST_MARGIN
 
 local DEBUG_MODE = Settings.DEBUG_MODE
 local DEBUG_LIFETIME = Settings.DEBUG_LIFETIME
@@ -104,12 +105,12 @@ if DEBUG_MODE then
     end)
 end
 
-local function filterByInclude(owned: {BasePart}, include: {Instance}?): {BasePart}
+local function filterByInclude(owned: {BasePart}, include: {Instance}?): {Instance}
     if not include or #include == 0 then
-        return owned
+        return (owned :: any) :: {Instance}
     end
 
-    local filtered = {}
+    local filtered: {Instance} = {}
     for _, part in owned do
         for _, included in include do
             if part == included or part:IsDescendantOf(included) then
@@ -119,6 +120,32 @@ local function filterByInclude(owned: {BasePart}, include: {Instance}?): {BasePa
         end
     end
     return filtered
+end
+
+local function mergeArrayUnique(result: {BasePart}, extra: {BasePart})
+    local seen: {[BasePart]: boolean} = {}
+    for _, part in result do
+        seen[part] = true
+    end
+    for _, part in extra do
+        if not seen[part] then
+            seen[part] = true
+            table.insert(result, part)
+        end
+    end
+end
+
+local function mergeSetUnique(result: {BasePart}, extra: {[BasePart]: any})
+    local seen: {[BasePart]: boolean} = {}
+    for _, part in result do
+        seen[part] = true
+    end
+    for part in extra do
+        if not seen[part] then
+            seen[part] = true
+            table.insert(result, part)
+        end
+    end
 end
 
 local function raycastExcludeRetry(origin: Vector3, direction: Vector3, params: RaycastParams, check: (BasePart) -> boolean): (RaycastResult?, number?)
@@ -269,11 +296,7 @@ local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) 
         end
         ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil)
         local ownedResult = queryFn(ownedParams)
-        for _, part in ownedResult do
-            if not table.find(result, part) then
-                table.insert(result, part)
-            end
-        end
+        mergeArrayUnique(result, ownedResult)
     end
 
     if check then
@@ -481,11 +504,7 @@ function Central.GetBoundsInRadius(player:Player, position:Vector3, radius:numbe
 
     if isServer then
         local serverResult = CentralServer.QueryPlayerShape(player, CFrame.new(position), bolt.create_sphere(radius), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        for part,_ in serverResult do
-            if not table.find(result, part) then
-                table.insert(result, part)
-            end
-        end
+        mergeSetUnique(result, serverResult)
     end
 
     if DEBUG_MODE and #result > 0 then
@@ -511,11 +530,7 @@ function Central.GetPartBoundsInBox(player:Player, cframe:CFrame, size:Vector3, 
 
     if isServer then
         local serverResult = CentralServer.QueryPlayerShape(player, cframe, bolt.create_box(size), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        for part,_ in serverResult do
-            if not table.find(result, part) then
-                table.insert(result, part)
-            end
-        end
+        mergeSetUnique(result, serverResult)
     end
 
     if DEBUG_MODE and #result > 0 then
@@ -540,11 +555,7 @@ function Central.GetPartsInPart(player:Player, part:Part, overlapParams:OverlapP
 
     if isServer then
         local serverResult = CentralServer.QueryPlayerShape(player, part.CFrame, bolt.create_from_part(part), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        for otherPart,_ in serverResult do
-            if not table.find(result, otherPart) then
-                table.insert(result, otherPart)
-            end
-        end
+        mergeSetUnique(result, serverResult)
     end
 
     if DEBUG_MODE and #result > 0 then

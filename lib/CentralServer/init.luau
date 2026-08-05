@@ -1,4 +1,6 @@
+--!native
 --!strict
+--!optimize 2
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
@@ -209,13 +211,9 @@ function CentralServer.Start()
 			HistoricalIndex:AddPart(register)
 
 		end
-		RegistersPending = {}
+		table.clear(RegistersPending)
 
 		GlobalTimeRegister:Step()
-
-		for _, register in PartRegisters do
-			register:Step()
-		end
 
 		HistoricalIndex:UpdateFrame(GlobalTimeRegister.index)
 
@@ -250,7 +248,7 @@ function CentralServer.QueryPlayerSimpleShapecast(player:Player, cframe:CFrame, 
 	return hitbox, distance
 end
 
-function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt.Shape, frameRange:number?, params: OverlapParams?, check: ((BasePart) -> boolean)?) : {[BasePart]:HistoricalHitboxes.Hitbox}?
+function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt.Shape, frameRange:number?, params: OverlapParams?, check: ((BasePart) -> boolean)?) : {[BasePart]:HistoricalHitboxes.Hitbox}
 	local range = frameRange or DEFAULT_COLLISION_RANGE
 	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
 	local results = HistoricalIndex:QueryShape(player, playerIndex, range, cframe, shape, params, check)

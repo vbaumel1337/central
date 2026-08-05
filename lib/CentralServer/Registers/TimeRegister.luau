@@ -9,7 +9,7 @@ type TimeData = {
 }
 
 export type TimeRegister = FrameRegister.FrameRegister<TimeData> & {
-	GetIndexAtTime: (self: TimeRegister, t:number) -> number
+	GetIndexAtTime: (self: TimeRegister, t:number) -> number?
 }
 
 function TimeRegister.new(frameCap: number, initialIndex:number): TimeRegister
