@@ -1,12 +1,12 @@
 [package]
 name = "vbaumel1337/central"
 description = "Server-authoritative hitbox, raycast, and shapecast querying with client-side latency compensation"
-version = "0.1.1"
+version = "0.1.2"
 license = "MIT"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 exclude = ["**"]
-include = ["lib", "lib/**", "wally.toml", "README.md", "LICENSE.md"]
+include = ["lib", "lib/**", "wally.toml", "README.md", "LICENSE.md", "default.project.json"]
 
 [dependencies]
 Observers = "sleitnick/observers@^0.4.0"
