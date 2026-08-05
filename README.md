@@ -26,7 +26,7 @@ Add to your `wally.toml`:
 
 ```toml
 [dependencies]
-Central = "vbaumel1337/central@^0.1.0"
+Central = "vbaumel1337/central@^0.1.3"
 ```
 
 Then `wally install`.
@@ -34,9 +34,11 @@ Then `wally install`.
 ## Examples
 
 A runnable example place is included at
-[`examples/Server Authoritative Hitboxes Demo.rbxl`](<examples/Server Authoritative Hitboxes Demo.rbxl>) —
-open it in Roblox Studio to see lag-compensated hitboxes, latency
-measurement, and synced client/server queries in action.
+[`examples/Server Authoritative Hitboxes Demo.rbxl`](<examples/Server Authoritative Hitboxes Demo.rbxl>).
+
+**Commands**: F fires an projectile, E fires an laser gun, Q does a super jump.
+
+This game will throw errors and lag sometimes due to roblox's instance sitching being very buggy at the moment.
 
 It's also playable and copyable live on Roblox:
 [Server-Authoritative Hitboxes Demo](https://www.roblox.com/games/92062322926252/Server-Authoritative-Hitboxes-Demo).
@@ -377,11 +379,8 @@ way to change a default.
 
 ## Third-party code
 
-`lib/bolt` and `lib/visualizer.luau` are vendored from
-[unityjaeger/Bolt](https://github.com/unityjaeger/Bolt) (MIT). See
-`lib/bolt/LICENSE`.
+`lib/bolt` and `lib/visualizer.luau` from
+[unityjaeger/Bolt](https://github.com/unityjaeger/Bolt) 
 
-Central also depends on [Observers](https://sleitnick.github.io/RbxObservers/api/Observers/)
-(`sleitnick/observers`), pulled in as a regular Wally dependency (see
-`wally.toml`) rather than vendored — it's used to watch for tagged hitbox
-parts, player/character spawns, and attribute changes.
+[Observers](https://sleitnick.github.io/RbxObservers/api/Observers/)
+(`sleitnick/observers`), pulled in as a regular Wally dependency
