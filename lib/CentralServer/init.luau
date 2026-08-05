@@ -5,7 +5,7 @@ local Players = game:GetService("Players")
 
 local Registers = script.Registers
 local TimeRegister = require(Registers.TimeRegister)
-local Observers = require(script.Parent.Parent.Packages.Observers)
+local Observers = require(script.Parent.Parent.Observers)
 local HistoricalHitboxes = require(script.HistoricalHitboxes)
 local PartRegister = require(script.Registers.PartRegister)
 local Settings = require(script.Parent.Settings)

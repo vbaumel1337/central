@@ -1,6 +1,6 @@
 --!strict
 local Settings = require(script.Parent.Parent.Parent.Settings)
-local Observers = require(script.Parent.Parent.Parent.Parent.Packages.Observers)
+local Observers = require(script.Parent.Parent.Parent.Parent.Observers)
 local FrameRegister = require(script.Parent.FrameRegister)
 
 local PartRegister = setmetatable({}, FrameRegister)
