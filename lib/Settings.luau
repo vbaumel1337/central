@@ -1,0 +1,35 @@
+local DEFAULT_HITBOX_COLLISIONGROUP = "HitboxCollison"
+local DEFAULT_HITBOX_QUERY_GROUP = "HitboxQuery"
+
+local Settings = {
+    DEBUG_MODE = false,
+    DEBUG_LIFETIME = 1.5,
+
+    StepFrequency = Enum.StepFrequency.Hz60,
+    HitboxStepPriority = 1000,
+
+    AUTO_ADD_CHARCTERS  = true,
+
+    DEFAULT_HITBOX_QUERY_GROUP = DEFAULT_HITBOX_QUERY_GROUP,
+    INITIAL_QUERY_GROUPS = {DEFAULT_HITBOX_QUERY_GROUP},
+
+    DEFAULT_HITBOX_COLLISIONGROUP = DEFAULT_HITBOX_COLLISIONGROUP,
+    INITIAL_COLLISION_GROUPS = {DEFAULT_HITBOX_COLLISIONGROUP},
+
+
+    HITBOX_TAG = "CompensatedHitbox",
+    OWNER_ATTRIBUTE = "HitboxOwner",
+    LATENCY_ATTRIBUTE = "PartLatency",
+
+    FRAME_CAP = 60,
+    RAYCAST_FRAME_RANGE = 2,
+    COLLISION_FRAME_RANGE = 1,
+
+    LATENCY_MULTIPLIER = 1.42, -- this number was releaved to me in a dream
+    HITBOX_SIZE_MULTIPLIER = 1,
+
+    AABB_PADDING = 1,
+}
+
+
+return Settings
