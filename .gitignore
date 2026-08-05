@@ -3,3 +3,4 @@ wally.lock
 *.rbxlx
 *.rbxl
 selene.toml
+!examples/*.rbxl

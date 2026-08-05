@@ -31,6 +31,16 @@ Central = "vbaumel1337/central@^0.1.0"
 
 Then `wally install`.
 
+## Examples
+
+A runnable example place is included at
+[`examples/Server Authoritative Hitboxes Demo.rbxl`](<examples/Server Authoritative Hitboxes Demo.rbxl>) —
+open it in Roblox Studio to see lag-compensated hitboxes, latency
+measurement, and synced client/server queries in action.
+
+It's also playable and copyable live on Roblox:
+[Server-Authoritative Hitboxes Demo](https://www.roblox.com/games/92062322926252/Server-Authoritative-Hitboxes-Demo).
+
 ## Usage
 
 Central is a single module required from both the server and the client;
