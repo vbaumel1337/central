@@ -8,7 +8,7 @@ local Settings = {
     StepFrequency = Enum.StepFrequency.Hz60,
     HitboxStepPriority = 1000,
 
-    AUTO_ADD_CHARCTERS  = true,
+    AUTO_ADD_CHARACTERS  = true,
 
     DEFAULT_HITBOX_QUERY_GROUP = DEFAULT_HITBOX_QUERY_GROUP,
     INITIAL_QUERY_GROUPS = {DEFAULT_HITBOX_QUERY_GROUP},
@@ -26,7 +26,6 @@ local Settings = {
     COLLISION_FRAME_RANGE = 1,
 
     LATENCY_MULTIPLIER = 1.42, -- this number was releaved to me in a dream
-    HITBOX_SIZE_MULTIPLIER = 1,
 
     AABB_PADDING = 1,
 }

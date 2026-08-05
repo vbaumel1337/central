@@ -258,7 +258,7 @@ whole reason a custom query group needs to be registered.
   `Raycast`/`Shapecast`/`SimpleShapecast` it also makes the live cast
   pierce through failing parts instead of stopping on them.
 
-See `lib/Settings.luau` for all tunable defaults (step frequency, frame
+See [Settings](#settings) for all tunable defaults (step frequency, frame
 history depth, tag/attribute names, etc).
 
 ## Getting Synced Client/Server Results Under `BindToSimulation`
@@ -345,6 +345,35 @@ to drift out of accuracy under different conditions (network profile,
 server tick rate, physics load, etc.). In testing so far it has held up
 well, but it isn't a guarantee, keep an eye on it rather than assuming
 it'll stay correct forever.
+
+## Settings
+
+Every tunable lives as a plain field on the table at `lib/Settings.luau`
+(`Central.Settings`/`CentralServer.Settings` are the same table). Several
+fields get captured into local variables the moment the package is first
+required, so mutating `Central.Settings` at runtime doesn't reliably take
+effect for all of them — editing `lib/Settings.luau` directly is the safest
+way to change a default.
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `DEBUG_MODE` | `false` | Draws rays/hit boxes for every query via the vendored Bolt visualizer. Costs performance — leave off outside debugging. |
+| `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. Only matters if `DEBUG_MODE` is on. |
+| `StepFrequency` | `Enum.StepFrequency.Hz60` | How often Central's own `BindToSimulation` loop records a hitbox frame and recomputes each player's rewound index — see [Getting Synced Client/Server Results](#getting-synced-clientserver-results-under-bindtosimulation). |
+| `HitboxStepPriority` | `1000` | The priority Central's internal `BindToSimulation` binding runs at. Your own query-calling bindings need a higher priority number than this. |
+| `AUTO_ADD_CHARACTERS` | `true` | Auto-tags every part of a spawning player's character as an owned hitbox. |
+| `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | The query collision group Central falls back to when a query's `CollisionGroup` isn't a registered query group. |
+| `INITIAL_QUERY_GROUPS` | `{DEFAULT_HITBOX_QUERY_GROUP}` | Query groups registered automatically by `Central.Start()`, equivalent to calling `Central.AddQueryGroup` for each. |
+| `DEFAULT_HITBOX_COLLISIONGROUP` | `"HitboxCollison"` | The collision group a tagged hitbox part is forced onto if its `CollisionGroup` isn't a registered hitbox group. |
+| `INITIAL_COLLISION_GROUPS` | `{DEFAULT_HITBOX_COLLISIONGROUP}` | Hitbox groups registered automatically by `Central.Start()`, equivalent to calling `Central.AddCollisionGroup` for each. |
+| `HITBOX_TAG` | `"CompensatedHitbox"` | The `CollectionService` tag that marks a `BasePart` as lag-compensated — see [Creating a hitbox](#creating-a-hitbox). |
+| `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name` — see [Creating a hitbox](#creating-a-hitbox). |
+| `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's measured, multiplied latency to — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `FRAME_CAP` | `60` | Size of the hitbox/time history ring buffer. Combined with `StepFrequency`, this bounds how far back Central can rewind (60 frames at 60 Hz ≈ 1 second by default). |
+| `RAYCAST_FRAME_RANGE` | `2` | Default `querySettings.frameRange` for `Central.Raycast`. |
+| `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/the overlap functions. |
+| `LATENCY_MULTIPLIER` | `1.42` | Empirically-tuned factor applied to measured latency before it's written to `LATENCY_ATTRIBUTE` — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `AABB_PADDING` | `1` | Padding (in studs) added around each hitbox's bounding box in the per-frame AABB tree, giving queries slack before the tree needs a partial rebuild as parts move. |
 
 ## Third-party code
 
