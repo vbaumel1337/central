@@ -380,3 +380,8 @@ way to change a default.
 `lib/bolt` and `lib/visualizer.luau` are vendored from
 [unityjaeger/Bolt](https://github.com/unityjaeger/Bolt) (MIT). See
 `lib/bolt/LICENSE`.
+
+Central also depends on [Observers](https://sleitnick.github.io/RbxObservers/api/Observers/)
+(`sleitnick/observers`), pulled in as a regular Wally dependency (see
+`wally.toml`) rather than vendored — it's used to watch for tagged hitbox
+parts, player/character spawns, and attribute changes.
