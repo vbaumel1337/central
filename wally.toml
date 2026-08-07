@@ -1,7 +1,7 @@
 [package]
 name = "vbaumel1337/central"
 description = "Server-authoritative hitbox, raycast, and shapecast querying with client-side latency compensation"
-version = "0.1.4"
+version = "0.1.5"
 license = "MIT"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"

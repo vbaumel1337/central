@@ -26,7 +26,7 @@ Add to your `wally.toml`:
 
 ```toml
 [dependencies]
-Central = "vbaumel1337/central@^0.1.3"
+Central = "vbaumel1337/central@^0.1.5"
 ```
 
 Then `wally install`.
@@ -172,6 +172,49 @@ Central.RemoveQueryGroup("EnemyQuery")
 registered automatically by `Central.Start()`; by default each just
 contains `Settings.DEFAULT_HITBOX_COLLISIONGROUP`/
 `Settings.DEFAULT_HITBOX_QUERY_GROUP`.
+
+#### Debug Hitbox Visualization (server only)
+
+Only active when `Settings.DEBUG_MODE` is `true`; otherwise these are
+no-ops with zero added per-frame cost. When on, drawing happens via the
+same vendored Bolt visualizer used for `DEBUG_MODE`'s query draws (see
+[Settings](#settings)), except these persist frame after frame instead of
+decaying, until explicitly hidden.
+
+**`Central.ShowHitboxes(player, owner)`** continuously draws `owner`'s
+hitboxes at the historical frame `player` is currently lag-compensated
+against, i.e. exactly what Central resolves `player`'s queries against.
+`owner` is a player's `Name`, or `"Server"` for hitboxes with no
+`Settings.OWNER_ATTRIBUTE` set. Safe to call again with a different
+`owner` for the same `player`, both draw at once.
+
+```lua
+Central.ShowHitboxes(player, "SomeEnemy")
+```
+
+**`Central.HideHitboxes(player, owner)`** stops the draw started by
+`ShowHitboxes` for that `(player, owner)` pair.
+
+```lua
+Central.HideHitboxes(player, "SomeEnemy")
+```
+
+**`Central.ShowAllPlayerHitboxes(player)`** like `ShowHitboxes`, but for
+every other connected player plus `"Server"`-owned hitboxes at once,
+recomputed live each frame so joins/leaves are picked up automatically.
+
+```lua
+Central.ShowAllPlayerHitboxes(player)
+```
+
+**`Central.RemoveAllPlayerHitboxes(player)`** stops the draw started by
+`ShowAllPlayerHitboxes` for `player`.
+
+```lua
+Central.RemoveAllPlayerHitboxes(player)
+```
+
+All four clean up automatically on `Players.PlayerRemoving`.
 
 ## Creating and Querying a Lag-compensated Hitbox
 
@@ -359,7 +402,7 @@ way to change a default.
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `DEBUG_MODE` | `false` | Draws rays/hit boxes for every query via the vendored Bolt visualizer. Costs performance — leave off outside debugging. |
+| `DEBUG_MODE` | `false` | Draws rays/hit boxes for every query via the vendored Bolt visualizer, and gates `Central.ShowHitboxes`/`HideHitboxes`/`ShowAllPlayerHitboxes`/`RemoveAllPlayerHitboxes` — see [Debug Hitbox Visualization](#debug-hitbox-visualization-server-only). Costs performance — leave off outside debugging. |
 | `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. Only matters if `DEBUG_MODE` is on. |
 | `StepFrequency` | `Enum.StepFrequency.Hz60` | How often Central's own `BindToSimulation` loop records a hitbox frame and recomputes each player's rewound index — see [Getting Synced Client/Server Results](#getting-synced-clientserver-results-under-bindtosimulation). |
 | `HitboxStepPriority` | `1000` | The priority Central's internal `BindToSimulation` binding runs at. Your own query-calling bindings need a higher priority number than this. |
