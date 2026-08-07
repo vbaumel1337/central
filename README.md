@@ -55,7 +55,7 @@ Central.Start()
 
 Call `Central.Start()` once, early, on both the server and the client
 (e.g. from your bootstrap scripts) before using any of the query functions
-below. Calling it more than once, or from the wrong realm, warns and no-ops.
+below.
 
 ### API
 
@@ -118,9 +118,7 @@ Central.RemoveQueryGroup("EnemyQuery")
 
 #### Debug Hitbox Visualization (server only)
 
-Only active when `Settings.DEBUG_MODE` is `true`; otherwise these are
-no-ops with zero added per-frame cost. Drawing uses the same vendored
-Bolt visualizer as `DEBUG_MODE`'s query draws, except these persist until
+Only active when `Settings.DEBUG_MODE` is `true`. Drawing uses the same visualizer as `DEBUG_MODE`'s query draws, except these persist until
 explicitly hidden. All four clean up automatically on
 `Players.PlayerRemoving`.
 
