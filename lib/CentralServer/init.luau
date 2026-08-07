@@ -256,4 +256,9 @@ function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt
 	return results
 end
 
+function CentralServer.GetPredictedHitboxes(player: Player, ownerName: string) : {HistoricalHitboxes.Hitbox}
+	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
+	return HistoricalIndex:GetHitboxesForOwner(playerIndex, ownerName)
+end
+
 return CentralServer

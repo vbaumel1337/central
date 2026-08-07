@@ -1,5 +1,6 @@
 --!strict
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local isClient = RunService:IsClient()
 local isServer = RunService:IsServer()
@@ -24,6 +25,7 @@ local DEBUG_MODE = Settings.DEBUG_MODE
 local DEBUG_LIFETIME = Settings.DEBUG_LIFETIME
 local DEBUG_RAY_COLOR = Color3.new(0, 0, 1)
 local DEBUG_HIT_COLOR = Color3.new(0, 1, 0)
+local DEBUG_PREDICTED_HITBOX_COLOR = Color3.new(1, 1, 0)
 
 export type QueryConfiguration = {
     frameRange:number?,
@@ -91,6 +93,18 @@ local function pushDebugDraw(draw: () -> ())
     table.insert(debugDraws, {draw = draw, expireTime = os.clock() + DEBUG_LIFETIME})
 end
 
+local hitboxViews: {[Player]: {[string]: boolean}} = {}
+local hitboxViewsAll: {[Player]: boolean} = {}
+local SERVER_OWNER_NAME = "Server" -- matches PartRegister's default owner for unattributed hitboxes
+
+local function drawPredictedHitboxes(player: Player, ownerName: string)
+    local hitboxes = CentralServer.GetPredictedHitboxes(player, ownerName)
+    visualizer.next_color(DEBUG_PREDICTED_HITBOX_COLOR)
+    for _, hitbox in hitboxes do
+        visualizer.components.box(hitbox.cframe, hitbox.shape)
+    end
+end
+
 if DEBUG_MODE then
     RunService.PostSimulation:Connect(function()
         local now = os.clock()
@@ -102,7 +116,92 @@ if DEBUG_MODE then
             end
             entry.draw()
         end
+
+        if isServer then
+            for player, owners in hitboxViews do
+                for ownerName in owners do
+                    drawPredictedHitboxes(player, ownerName)
+                end
+            end
+
+            for player in hitboxViewsAll do
+                for _, otherPlayer in Players:GetPlayers() do
+                    if otherPlayer == player then
+                        continue
+                    end
+                    drawPredictedHitboxes(player, otherPlayer.Name)
+                end
+                drawPredictedHitboxes(player, SERVER_OWNER_NAME)
+            end
+        end
     end)
+
+    if isServer then
+        Players.PlayerRemoving:Connect(function(player)
+            hitboxViews[player] = nil
+            hitboxViewsAll[player] = nil
+        end)
+    end
+end
+
+function Central.ShowHitboxes(player: Player, owner: string)
+    if not DEBUG_MODE then
+        return
+    end
+    if not isServer then
+        warn("Central.ShowHitboxes can only be called on the server")
+        return
+    end
+
+    local owners = hitboxViews[player]
+    if not owners then
+        owners = {}
+        hitboxViews[player] = owners
+    end
+    owners[owner] = true
+end
+
+function Central.HideHitboxes(player: Player, owner: string)
+    if not DEBUG_MODE then
+        return
+    end
+    if not isServer then
+        warn("Central.HideHitboxes can only be called on the server")
+        return
+    end
+
+    local owners = hitboxViews[player]
+    if not owners then
+        return
+    end
+    owners[owner] = nil
+    if next(owners) == nil then
+        hitboxViews[player] = nil
+    end
+end
+
+function Central.ShowAllPlayerHitboxes(player: Player)
+    if not DEBUG_MODE then
+        return
+    end
+    if not isServer then
+        warn("Central.ShowAllPlayerHitboxes can only be called on the server")
+        return
+    end
+
+    hitboxViewsAll[player] = true
+end
+
+function Central.RemoveAllPlayerHitboxes(player: Player)
+    if not DEBUG_MODE then
+        return
+    end
+    if not isServer then
+        warn("Central.RemoveAllPlayerHitboxes can only be called on the server")
+        return
+    end
+
+    hitboxViewsAll[player] = nil
 end
 
 local function filterByInclude(owned: {BasePart}, include: {Instance}?): {Instance}

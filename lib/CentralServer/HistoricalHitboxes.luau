@@ -47,6 +47,7 @@ export type HistoricalHitboxes = typeof(setmetatable(
 		QueryShapecast: (self: any, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?) -> (Hitbox?, Vector3?, number?, Vector3?),
 		QuerySimpleShapecast: (self: any, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?) -> (Hitbox?, number?),
 		QueryShape: (self: any, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?) -> {[BasePart]: Hitbox},
+		GetHitboxesForOwner: (self: any, index: number, ownerName: string) -> {Hitbox},
 		Destroy: (self: any) -> (),
 	},
 	HistoricalHitboxes
@@ -351,6 +352,17 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 				resultHitbox.frameOffset = offset
 				results[hitbox.instance] = resultHitbox
 			end
+		end
+	end
+	return results
+end
+
+function HistoricalHitboxes.GetHitboxesForOwner(self: HistoricalHitboxes, index: number, ownerName: string): {Hitbox}
+	local frameHitboxes = self.hitboxes[wrapIndex(index, self.frameCap)]
+	local results: {Hitbox} = {}
+	for _, hitbox in frameHitboxes do
+		if hitbox.owner == ownerName then
+			table.insert(results, hitbox)
 		end
 	end
 	return results
