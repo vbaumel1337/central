@@ -62,63 +62,31 @@ below. Calling it more than once, or from the wrong realm, warns and no-ops.
 #### Queries
 
 Every query takes the `player` it's being cast on behalf of (used to
-lag-compensate against, and to resolve that player's own hitboxes live,
-see [Querying hitboxes](#querying-hitboxes)) and an optional `querySettings`.
-On the client these are a plain pass-through to their Roblox counterpart;
-on the server they additionally merge in a lag-compensated result.
-
-**`Central.Raycast(player, origin, direction, raycastParams?, querySettings?)`**
-counterpart to `workspace:Raycast(origin, direction, raycastParams)`.
-Casts a ray from `origin` in `direction` and returns the closest hit as
-`(distance, instance, position, normal)` instead of a `RaycastResult`.
+lag-compensate against) and an optional `querySettings`. On the client
+these are a plain pass-through to their Roblox counterpart; on the server
+they additionally merge in a lag-compensated result.
 
 ```lua
+-- counterpart to workspace:Raycast(origin, direction, raycastParams)
 local distance, instance, position, normal =
     Central.Raycast(player, origin, direction, raycastParams)
-```
 
-**`Central.Shapecast(player, part, direction, raycastParams?, querySettings?)`**
-counterpart to `workspace:Shapecast(part, direction, raycastParams)`.
-Sweeps `part`'s shape along `direction` and returns the closest hit as
-`(distance, instance, position, normal)`.
-
-```lua
+-- counterpart to workspace:Shapecast(part, direction, raycastParams)
 local distance, instance, position, normal =
     Central.Shapecast(player, part, direction, raycastParams)
-```
 
-**`Central.SimpleShapecast(player, part, direction, raycastParams?, querySettings?)`**
-also backed by `workspace:Shapecast` on the live side, but its
-lag-compensated half skips computing an exact contact point/normal, only
-checking whether and how far along `direction` a hit occurs. Cheaper than
-`Shapecast` when you don't need the hit position.
-
-```lua
+-- like Shapecast, but skips computing an exact position/normal - cheaper
+-- when you only need to know whether and how far along direction a hit occurs
 local distance, instance =
     Central.SimpleShapecast(player, part, direction, raycastParams)
-```
 
-**`Central.GetBoundsInRadius(player, position, radius, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartBoundsInRadius(position, radius, overlapParams)`.
-Returns `{BasePart}` overlapping a sphere of `radius` at `position`.
-
-```lua
+-- counterpart to workspace:GetPartBoundsInRadius(position, radius, overlapParams)
 local parts = Central.GetBoundsInRadius(player, position, radius, overlapParams)
-```
 
-**`Central.GetPartBoundsInBox(player, cframe, size, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartBoundsInBox(cframe, size, overlapParams)`.
-Returns `{BasePart}` overlapping an oriented box.
-
-```lua
+-- counterpart to workspace:GetPartBoundsInBox(cframe, size, overlapParams)
 local parts = Central.GetPartBoundsInBox(player, cframe, size, overlapParams)
-```
 
-**`Central.GetPartsInPart(player, part, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartsInPart(part, overlapParams)`. Returns
-`{BasePart}` overlapping `part`'s own shape and position.
-
-```lua
+-- counterpart to workspace:GetPartsInPart(part, overlapParams)
 local parts = Central.GetPartsInPart(player, part, overlapParams)
 ```
 
@@ -128,93 +96,49 @@ Server-only calls for registering the two collision-group families
 described in
 [Creating and Querying a Lag-compensated Hitbox](#creating-and-querying-a-lag-compensated-hitbox).
 Under the hood these wrap `PhysicsService:RegisterCollisionGroup` and
-`PhysicsService:CollisionGroupSetCollidable`.
-
-**`Central.AddCollisionGroup(name)`** registers `name` as a hitbox
-collision group: creates the `PhysicsService` group if it doesn't exist
-yet, and sets it non-collidable with every group already registered via
-`AddQueryGroup`. A tagged hitbox part whose `CollisionGroup` isn't a
-registered hitbox group gets forced onto
-`Settings.DEFAULT_HITBOX_COLLISIONGROUP` instead.
+`PhysicsService:CollisionGroupSetCollidable`. `Settings.INITIAL_COLLISION_GROUPS`/
+`Settings.INITIAL_QUERY_GROUPS` are registered automatically by
+`Central.Start()`.
 
 ```lua
+-- registers "EnemyHitbox" as a hitbox group, non-collidable with every
+-- registered query group; use as a tagged hitbox part's CollisionGroup
 Central.AddCollisionGroup("EnemyHitbox")
-```
 
-**`Central.RemoveCollisionGroup(name)`** reverses that: restores
-collidability between `name` and every registered query group, and stops
-treating `name` as a hitbox group.
-
-```lua
+-- reverses AddCollisionGroup: restores collidability, stops treating it as a hitbox group
 Central.RemoveCollisionGroup("EnemyHitbox")
-```
 
-**`Central.AddQueryGroup(name)`** registers `name` as a query collision
-group: creates the `PhysicsService` group if needed, and sets it
-non-collidable with every registered hitbox group. Pass it as
-`CollisionGroup` on the `RaycastParams`/`OverlapParams` you give to the
-query functions above.
-
-```lua
+-- registers "EnemyQuery" as a query group, non-collidable with every
+-- registered hitbox group; use as a query's RaycastParams/OverlapParams.CollisionGroup
 Central.AddQueryGroup("EnemyQuery")
-```
 
-**`Central.RemoveQueryGroup(name)`** reverses that: restores
-collidability with every registered hitbox group, and stops treating
-`name` as a query group. As with `RemoveCollisionGroup`, the underlying
-`PhysicsService` group is left registered rather than unregistered.
-
-```lua
+-- reverses AddQueryGroup: restores collidability, stops treating it as a query group
 Central.RemoveQueryGroup("EnemyQuery")
 ```
-
-`Settings.INITIAL_COLLISION_GROUPS`/`Settings.INITIAL_QUERY_GROUPS` are
-registered automatically by `Central.Start()`; by default each just
-contains `Settings.DEFAULT_HITBOX_COLLISIONGROUP`/
-`Settings.DEFAULT_HITBOX_QUERY_GROUP`.
 
 #### Debug Hitbox Visualization (server only)
 
 Only active when `Settings.DEBUG_MODE` is `true`; otherwise these are
-no-ops with zero added per-frame cost. When on, drawing happens via the
-same vendored Bolt visualizer used for `DEBUG_MODE`'s query draws (see
-[Settings](#settings)), except these persist frame after frame instead of
-decaying, until explicitly hidden.
-
-**`Central.ShowHitboxes(player, owner)`** continuously draws `owner`'s
-hitboxes at the historical frame `player` is currently lag-compensated
-against, i.e. exactly what Central resolves `player`'s queries against.
-`owner` is a player's `Name`, or `"Server"` for hitboxes with no
-`Settings.OWNER_ATTRIBUTE` set. Safe to call again with a different
-`owner` for the same `player`, both draw at once.
+no-ops with zero added per-frame cost. Drawing uses the same vendored
+Bolt visualizer as `DEBUG_MODE`'s query draws, except these persist until
+explicitly hidden. All four clean up automatically on
+`Players.PlayerRemoving`.
 
 ```lua
+-- continuously draws "SomeEnemy"'s hitboxes at the historical frame `player`
+-- is currently lag-compensated against, i.e. what player's queries resolve against
 Central.ShowHitboxes(player, "SomeEnemy")
-```
 
-**`Central.HideHitboxes(player, owner)`** stops the draw started by
-`ShowHitboxes` for that `(player, owner)` pair.
-
-```lua
+-- stops the draw started by ShowHitboxes for that (player, owner) pair
 Central.HideHitboxes(player, "SomeEnemy")
-```
 
-**`Central.ShowAllPlayerHitboxes(player)`** like `ShowHitboxes`, but for
-every other connected player plus `"Server"`-owned hitboxes at once,
-recomputed live each frame so joins/leaves are picked up automatically.
-
-```lua
+-- like ShowHitboxes, but for every other connected player plus "Server"-owned
+-- hitboxes at once, recomputed live each frame
 Central.ShowAllPlayerHitboxes(player)
-```
 
-**`Central.RemoveAllPlayerHitboxes(player)`** stops the draw started by
-`ShowAllPlayerHitboxes` for `player`.
-
-```lua
+-- stops the draw started by ShowAllPlayerHitboxes for player
 Central.RemoveAllPlayerHitboxes(player)
 ```
-
-All four clean up automatically on `Players.PlayerRemoving`.
 
 ## Creating and Querying a Lag-compensated Hitbox
 
