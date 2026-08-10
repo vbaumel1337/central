@@ -300,7 +300,7 @@ the number Central actually rewinds hitbox history by. The multiplier
 (`1.42` by default) isn't derived from anything, it's a number found
 by trial and error until the numbers lined up.
 ```lua
-LATENCY_MULTIPLIER = 1.42, -- this number was releaved to me in a dream
+LATENCY_MULTIPLIER = 1.42, -- this number was revealed to me in a dream
 ```
 
 If your own testing shows compensation consistently running ahead of or
