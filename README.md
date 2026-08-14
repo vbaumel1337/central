@@ -487,32 +487,55 @@ how many exist.
 
 ### Cost per frame
 
+The numbers below are the median of 600 timed frames, each one covering
+`UpdateFrame` plus the stated number of queries. They are measured in
+place, so they include the cache pressure a query really pays after
+`UpdateFrame` has just walked the whole tree — a query timed alone in a
+tight loop looks 1.5–2× cheaper than it is in a frame.
+
 `UpdateFrame` runs once per simulation step whether or not you query, and
-is linear in hitbox count:
+is roughly linear in hitbox count (the `0 casts` column below):
 
 | hitboxes | per frame | per hitbox |
 |---|---|---|
-| 50 | 56 µs | 1.13 µs |
-| 100 | 119 µs | 1.19 µs |
-| 200 | 289 µs | 1.44 µs |
-| 400 | 596 µs | 1.49 µs |
-| 800 | 1335 µs | 1.67 µs |
+| 50 | 69 µs | 1.38 µs |
+| 100 | 156 µs | 1.56 µs |
+| 200 | 364 µs | 1.82 µs |
+| 400 | 778 µs | 1.95 µs |
+| 800 | 1730 µs | 2.16 µs |
 
-Combined with raycasts, as a share of one 60 Hz frame (16667 µs):
+Whole frame with raycasts, as a share of one 60 Hz frame (16667 µs):
 
-| hitboxes | 0 rays | 1 | 5 | 10 | 25 | 50 | 100 |
+| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
 |---|---|---|---|---|---|---|---|
-| 50 | 0.3% | 0.3% | 0.4% | 0.4% | 0.5% | 0.6% | 0.9% |
-| 100 | 0.7% | 0.7% | 0.7% | 0.8% | 0.9% | 1.0% | 1.3% |
-| 200 | 1.7% | 1.7% | 1.8% | 1.8% | 1.9% | 2.1% | 2.4% |
-| 400 | 3.6% | 3.6% | 3.6% | 3.6% | 3.7% | 3.9% | 4.2% |
-| 800 | 8.0% | 8.0% | 8.0% | 8.1% | 8.2% | 8.3% | 8.6% |
+| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.6% | 0.8% | 1.3% |
+| 100 | 0.9% | 1.0% | 1.1% | 1.2% | 1.3% | 1.6% | 1.9% |
+| 200 | 2.2% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.3% |
+| 400 | 4.7% | 5.0% | 5.1% | 5.0% | 5.2% | 5.5% | 6.1% |
+| 800 | 10.4% | 10.8% | 11.6% | 11.0% | 11.7% | 11.7% | 13.2% |
 
-Queries are close to free next to the per-frame bookkeeping: at 400
-hitboxes, going from zero to 100 raycasts per frame adds 0.6% of the
-budget, while the hitbox count alone already costs 3.6%. If you need to cut
-Central's cost, reduce how many parts carry `Settings.HITBOX_TAG` — adding
-query volume is comparatively cheap.
+And with shapecasts, which land within noise of the raycast figures at
+every count — the per-cast difference is small enough that `UpdateFrame`
+dominates either way:
+
+| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
+|---|---|---|---|---|---|---|---|
+| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.7% | 0.9% | 1.5% |
+| 100 | 1.0% | 1.0% | 1.1% | 1.1% | 1.3% | 1.6% | 2.1% |
+| 200 | 2.1% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.4% |
+| 400 | 4.7% | 4.9% | 4.9% | 5.1% | 5.1% | 5.4% | 6.0% |
+| 800 | 11.1% | 11.1% | 11.2% | 11.7% | 11.1% | 11.9% | 12.8% |
+
+Casts are cheap next to the per-frame bookkeeping: at 400 hitboxes, going
+from zero to 100 casts per frame adds about 1.3% of the budget, while the
+hitbox count alone already costs 4.7%. If you need to cut Central's cost,
+reduce how many parts carry `Settings.HITBOX_TAG` — adding query volume is
+comparatively cheap.
+
+One caveat on the medians: a tree occasionally rebuilds
+(`TREE_REBUILD_CHECK_INTERVAL`), which makes that frame markedly more
+expensive. Those spikes are real but rare and staggered across trees, so
+they sit in the tail rather than the median.
 
 ## Settings
 
