@@ -380,24 +380,19 @@ rather than round-trip ping. A cycle that never converges is abandoned after
 `Settings.LATENCY_MEASURE_PAUSE` gap between cycles.
 
 The client reports each result over a `RemoteEvent`. The server discards
-non-numbers and `NaN`, clamps the value into `[0, Settings.MAX_LATENCY]`,
-adds `Settings.LATENCY_OFFSET`, and averages the last
+non-numbers and `NaN`, adds `Settings.LATENCY_OFFSET`, clamps the result
+into `[0, Settings.MAX_LATENCY]`, and averages the last
 `Settings.LATENCY_SAMPLE_WINDOW` samples. That mean is what gets written to
 the player's `Settings.LATENCY_ATTRIBUTE`, and it's the number Central
-rewinds hitbox history by.
+rewinds hitbox history by. Because the offset is applied before the clamp,
+no amount of it can push the stored latency outside the history buffer's
+reach.
 
-Two things worth knowing:
-
-- **The measurement is client-reported.** The server sanity-checks and
-  clamps it, but does not independently verify it, so a modified client can
-  influence how far back its own shots are rewound — bounded by
-  `MAX_LATENCY`. If that matters for your game, treat `MAX_LATENCY` as the
-  security-relevant knob.
-- **`LATENCY_OFFSET` is applied after the clamp**, so a non-zero value can
-  push the stored latency outside `[0, MAX_LATENCY]`. Going beyond
-  `MAX_LATENCY` asks Central to rewind further than the history buffer
-  reaches, which resolves to the current frame instead — quietly disabling
-  compensation for that player rather than erroring.
+Worth knowing: **the measurement is client-reported.** The server
+sanity-checks and clamps it, but does not independently verify it, so a
+modified client can influence how far back its own shots are rewound —
+bounded by `MAX_LATENCY`. If that matters for your game, treat
+`MAX_LATENCY` as the security-relevant knob.
 
 ## Settings
 
@@ -428,7 +423,7 @@ way to change a default.
 | `PREFER_NEAREST_FRAME` | `true` | How a closest-hit query picks a winner when several frames in `frameRange` produce a hit. `true`: a hit in a frame nearer the player's rewound index wins outright, regardless of distance. `false`: the spatially closest hit across the whole range wins, ties going to the nearer frame. |
 | `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. The check scans every node, so running it on each frame update is wasteful while the trees stay balanced. |
 | `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomise each tree's next check, on top of an even initial stagger, so the trees never come due on the same frame. |
-| `LATENCY_OFFSET` | `0` | Seconds added to each clamped latency sample before it's averaged. Applied *after* the clamp — see the caveat in [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before it's clamped and averaged. Use it to bias compensation earlier or later if it consistently runs ahead of or behind what players see; the clamp keeps the result inside `[0, MAX_LATENCY]` either way. |
 | `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. Higher is steadier but slower to react to a change in a player's connection. |
 | `MAX_LATENCY` | `1` | Upper clamp (seconds) on a client-reported latency sample. Matches the history buffer's span (`FRAME_CAP` / `StepFrequency`), and bounds how far a modified client could push its own rewind. |
 | `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the measurement rig is parked, out of the playable map. |

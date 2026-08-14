@@ -81,7 +81,7 @@ function CharacterLatency.Start()
 			return
 		end
 
-		local sample = math.clamp(elapsed, 0, MAX_LATENCY) + LATENCY_OFFSET
+		local sample = math.clamp(elapsed + LATENCY_OFFSET, 0, MAX_LATENCY)
 
 		local samples = latencySamples[player]
 		if not samples then
