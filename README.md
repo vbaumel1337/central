@@ -408,7 +408,7 @@ of `1`, `PREFER_NEAREST_FRAME = true`, `FRAME_CAP = 60`).
 Absolute numbers will move with hardware; the scaling behaviour is the part
 worth reading.
 
-### Cost per query
+### Cost of queries
 
 Direct hits, in microseconds:
 
@@ -423,13 +423,67 @@ Direct hits, in microseconds:
 The three closest-hit queries are effectively flat in hitbox count — 16×
 the hitboxes costs the same — because the tree prunes to the closest hit
 during traversal and the frame scan stops at the first frame that produces
-one.
+one. What they actually cost depends on two other things instead.
 
-The overlap queries (`GetBoundsInRadius`/`GetPartBoundsInBox`/
-`GetPartsInPart`) are the exception, at roughly 1.1 µs per part *returned*.
-They have to report every overlap, so nothing prunes. Note the cost tracks
-the last column, not the first: what matters is how many hitboxes fall
-inside the query volume, not how many exist.
+**Whether the cast connects.** At 400 hitboxes:
+
+| | `Raycast` | `Shapecast` | `SimpleShapecast` |
+|---|---|---|---|
+| direct hit | 0.97 | 1.54 | 1.39 |
+| grazing contact | 1.28 | 14.65 | 14.20 |
+| empty space | 0.76 | 1.02 | 0.92 |
+
+A shapecast that barely clips a hitbox costs roughly 10× one that hits it
+squarely. A clean hit immediately bounds the search, so everything further
+away is skipped without an exact test — one narrow-phase call instead of
+sixteen, measured. A grazing contact never establishes that bound, so every
+candidate gets tested. Empty space is cheapest, since the broad phase
+rejects everything up front. Rays are barely affected either way, being
+infinitely thin.
+
+**Which shape you query with**, for the overlap functions. A hitbox is
+always stored as a box, so an overlap test is box × your query shape. Box,
+sphere and capsule have dedicated routines; everything else falls back to
+the general GJK solver. Per call, on an identical pair (µs):
+
+| query shape | overlapping | separated | routine |
+|---|---|---|---|
+| box | 0.137 | 0.071 | `box_box` |
+| sphere | 0.131 | 0.128 | `box_sphere` |
+| capsule | 0.242 | 0.194 | `box_capsule` |
+| cylinder | 0.532 | 0.325 | GJK fallback |
+| corner wedge | 0.730 | 0.349 | GJK fallback |
+| wedge | 0.737 | 0.339 | GJK fallback |
+| ellipsoid | 0.766 | 0.357 | GJK fallback |
+
+**The dedicated routines are 1.5–5× faster and return the same answer, so
+prefer the simplest shape that describes your query.** The difference is
+amplified in a real overlap call, because overlap queries must report every
+result and so can never prune — a slower test is paid in full, once per
+candidate per frame scanned. Over 400 hitboxes:
+
+| query shape | cost | parts returned | per part |
+|---|---|---|---|
+| box | 64.6 µs | 64 | 1.01 µs |
+| sphere | 60.0 µs | 32 | 1.87 µs |
+| cylinder | 161.7 µs | 48 | 3.37 µs |
+
+The cylinder costs about 2.5× the box query while returning fewer parts.
+Which branch you land on follows from the function you call:
+`GetPartBoundsInBox` always builds a box and `GetBoundsInRadius` always
+builds a sphere, so both stay on a dedicated routine. `GetPartsInPart`
+derives the shape from the part you hand it — a Block or Ball is fine, but
+a Cylinder, Wedge, CornerWedge or mesh part drops to GJK. If that's on a
+hot path, approximating it with `GetPartBoundsInBox` or `GetBoundsInRadius`
+is worth roughly 2.5× whenever the exact silhouette doesn't matter.
+
+Shape choice only affects the overlap functions;
+`Shapecast`/`SimpleShapecast` go through the GJK shapecast solver
+regardless.
+
+Overlap cost also tracks the last column of the first table rather than the
+first: what matters is how many hitboxes fall inside the query volume, not
+how many exist.
 
 ### Cost per frame
 
@@ -459,23 +513,6 @@ hitboxes, going from zero to 100 raycasts per frame adds 0.6% of the
 budget, while the hitbox count alone already costs 3.6%. If you need to cut
 Central's cost, reduce how many parts carry `Settings.HITBOX_TAG` — adding
 query volume is comparatively cheap.
-
-### Cast outcome matters more than hitbox count
-
-At 400 hitboxes, per query:
-
-| | `Raycast` | `Shapecast` | `SimpleShapecast` |
-|---|---|---|---|
-| direct hit | 0.97 | 1.54 | 1.39 |
-| grazing contact | 1.28 | 14.65 | 14.20 |
-| empty space | 0.76 | 1.02 | 0.92 |
-
-A shapecast that barely clips a hitbox costs roughly 10× one that hits it
-squarely. A clean hit lets the traversal prune everything further away
-immediately; a marginal contact leaves many candidates in play and runs the
-exact intersection test on each. Casts through empty space are cheapest of
-all, since the broad phase rejects everything up front. Rays are barely
-affected — being infinitely thin, they match few nodes either way.
 
 ## Settings
 
