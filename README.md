@@ -394,6 +394,89 @@ modified client can influence how far back its own shots are rewound —
 bounded by `MAX_LATENCY`. If that matters for your game, treat
 `MAX_LATENCY` as the security-relevant knob.
 
+## Performance
+
+Measured on the server in Studio against a synthetic rig: a cubic grid of
+3×3×3 anchored hitbox parts spaced 7 studs apart, every one of them moved
+each frame, with all 60 history frames populated at distinct poses. Queries
+are timed against `HistoricalHitboxes` directly, so these are the
+lag-compensation costs alone — `Central.Raycast` and friends add a live
+`workspace:Raycast`/`Shapecast` on top, whose cost depends on your map.
+Settings were the defaults (`RAYCAST_FRAME_RANGE`/`COLLISION_FRAME_RANGE`
+of `1`, `PREFER_NEAREST_FRAME = true`, `FRAME_CAP = 60`).
+
+Absolute numbers will move with hardware; the scaling behaviour is the part
+worth reading.
+
+### Cost per query
+
+Direct hits, in microseconds:
+
+| hitboxes | `Raycast` | `Shapecast` | `SimpleShapecast` | overlap | parts the overlap returned |
+|---|---|---|---|---|---|
+| 50 | 0.94 | 1.35 | 1.23 | 50.28 | 48 |
+| 100 | 0.99 | 1.46 | 1.40 | 34.23 | 27 |
+| 200 | 1.20 | 2.02 | 1.77 | 66.68 | 64 |
+| 400 | 1.01 | 1.51 | 1.40 | 70.75 | 64 |
+| 800 | 1.03 | 1.42 | 1.37 | 70.14 | 64 |
+
+The three closest-hit queries are effectively flat in hitbox count — 16×
+the hitboxes costs the same — because the tree prunes to the closest hit
+during traversal and the frame scan stops at the first frame that produces
+one.
+
+The overlap queries (`GetBoundsInRadius`/`GetPartBoundsInBox`/
+`GetPartsInPart`) are the exception, at roughly 1.1 µs per part *returned*.
+They have to report every overlap, so nothing prunes. Note the cost tracks
+the last column, not the first: what matters is how many hitboxes fall
+inside the query volume, not how many exist.
+
+### Cost per frame
+
+`UpdateFrame` runs once per simulation step whether or not you query, and
+is linear in hitbox count:
+
+| hitboxes | per frame | per hitbox |
+|---|---|---|
+| 50 | 56 µs | 1.13 µs |
+| 100 | 119 µs | 1.19 µs |
+| 200 | 289 µs | 1.44 µs |
+| 400 | 596 µs | 1.49 µs |
+| 800 | 1335 µs | 1.67 µs |
+
+Combined with raycasts, as a share of one 60 Hz frame (16667 µs):
+
+| hitboxes | 0 rays | 1 | 5 | 10 | 25 | 50 | 100 |
+|---|---|---|---|---|---|---|---|
+| 50 | 0.3% | 0.3% | 0.4% | 0.4% | 0.5% | 0.6% | 0.9% |
+| 100 | 0.7% | 0.7% | 0.7% | 0.8% | 0.9% | 1.0% | 1.3% |
+| 200 | 1.7% | 1.7% | 1.8% | 1.8% | 1.9% | 2.1% | 2.4% |
+| 400 | 3.6% | 3.6% | 3.6% | 3.6% | 3.7% | 3.9% | 4.2% |
+| 800 | 8.0% | 8.0% | 8.0% | 8.1% | 8.2% | 8.3% | 8.6% |
+
+Queries are close to free next to the per-frame bookkeeping: at 400
+hitboxes, going from zero to 100 raycasts per frame adds 0.6% of the
+budget, while the hitbox count alone already costs 3.6%. If you need to cut
+Central's cost, reduce how many parts carry `Settings.HITBOX_TAG` — adding
+query volume is comparatively cheap.
+
+### Cast outcome matters more than hitbox count
+
+At 400 hitboxes, per query:
+
+| | `Raycast` | `Shapecast` | `SimpleShapecast` |
+|---|---|---|---|
+| direct hit | 0.97 | 1.54 | 1.39 |
+| grazing contact | 1.28 | 14.65 | 14.20 |
+| empty space | 0.76 | 1.02 | 0.92 |
+
+A shapecast that barely clips a hitbox costs roughly 10× one that hits it
+squarely. A clean hit lets the traversal prune everything further away
+immediately; a marginal contact leaves many candidates in play and runs the
+exact intersection test on each. Casts through empty space are cheapest of
+all, since the broad phase rejects everything up front. Rays are barely
+affected — being infinitely thin, they match few nodes either way.
+
 ## Settings
 
 Every tunable lives as a plain field on the table at `lib/Settings.luau`
