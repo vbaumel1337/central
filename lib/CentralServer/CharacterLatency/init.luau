@@ -1,11 +1,29 @@
 --!strict
 local PhysicsService = game:GetService("PhysicsService")
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Settings = require(script.Parent.Parent.Settings)
+local SpinNPC = require(script.Parent.Parent.SpinNPC)
 
 local CharacterLatency = {}
 
 local hasStarted = false
+
+local function setDummyCollisionGroup(dummy: Model, group: string)
+	for _, part in dummy:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.CollisionGroup = group
+		end
+	end
+end
+
+local function unanchorDummy(dummy: Model)
+	for _, part in dummy:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.Anchored = false
+		end
+	end
+end
 
 function CharacterLatency.Start()
 	if not RunService:IsServer() then
@@ -21,130 +39,66 @@ function CharacterLatency.Start()
 
 	local Folder = script:WaitForChild("CharacterLatency")
 
-	local Platform = Folder:WaitForChild("Platform")
-	local PlatformPart = Platform:WaitForChild("Part") :: Part
-	local Part1 = Platform:WaitForChild("Part1") :: Part
-	local Part2 = Platform:WaitForChild("Part2") :: Part
 	local Remote = Folder:WaitForChild("CharacterLatencyRemote") :: RemoteEvent
-
-	local Dummy = Folder:WaitForChild("LatencyDummy")
-	Dummy:SetAttribute("Count", 1)
-	Dummy:SetAttribute("Moving", false)
-	Dummy:SetAttribute("State", 1)
+	local dummy1, dummy2 = Folder:WaitForChild("LatencyDummyPredicted"), Folder:WaitForChild("LatencyDummyDelayed")
+	local torso1, torso2 = dummy1:WaitForChild("Torso") :: Part, dummy2:WaitForChild("Torso") :: Part
+	local platformPart = Folder:WaitForChild("Platform"):WaitForChild("Part") :: Part
 
 	local LATENCY_ATTRIBUTE = Settings.LATENCY_ATTRIBUTE
+	local LATENCY_OFFSET = Settings.LATENCY_OFFSET
+	local MAX_LATENCY = Settings.MAX_LATENCY
+	local LATENCY_SAMPLE_WINDOW = Settings.LATENCY_SAMPLE_WINDOW
 
-	local humanoid = Dummy:WaitForChild("Humanoid") :: Humanoid
-	local root = humanoid.RootPart :: Part
+	local latencySamples = {} :: {[Player]: {number}}
+
+	Players.PlayerRemoving:Connect(function(player)
+		latencySamples[player] = nil
+	end)
 
 	local delta = Settings.LATENCY_DUMMY_HIDE_OFFSET
-	PlatformPart.CFrame += delta
-	Part1.CFrame += delta
-	Part2.CFrame += delta
-	root.CFrame += delta
+	torso1.CFrame += delta
+	torso2.CFrame += delta
+	platformPart.CFrame += delta
 
 	Folder.Parent = workspace
 
-	PhysicsService:RegisterCollisionGroup("LatencyDummy")
-	PhysicsService:CollisionGroupSetCollidable("LatencyDummy", "Default", false)
-	PhysicsService:CollisionGroupSetCollidable("LatencyDummy", "LatencyDummy", true)
+	PhysicsService:RegisterCollisionGroup("LatencyDummy1")
+	PhysicsService:RegisterCollisionGroup("LatencyDummy2")
+	PhysicsService:CollisionGroupSetCollidable("LatencyDummy1", "LatencyDummy2", false)
 
-	local LATENCY_MULTIPLIER = Settings.LATENCY_MULTIPLIER
-	local MAX_LATENCY = Settings.MAX_LATENCY
+	setDummyCollisionGroup(dummy1, "LatencyDummy1")
+	setDummyCollisionGroup(dummy2, "LatencyDummy2")
+	unanchorDummy(dummy1)
+	unanchorDummy(dummy2)
 
-	local atStart = true
+	SpinNPC(dummy1)
+	SpinNPC(dummy2)
 
-	local MAX_SERVER_STAMPS = Settings.LATENCY_STAMP_HISTORY
-
-	local CountTimes = {} :: {[number]: number}
-
-	local position1 = Part1.Position
-	local position2 = Part2.Position
-	local x1,x2 = position1.X, position2.X
-	local half  = math.abs(x1-x2)/2
-
-	local hasUpdated = false
-
-	task.defer(function()
-		while true do
-			while Dummy:GetAttribute("Moving") do
-				task.wait()
-			end
-
-			hasUpdated = false
-			local startX =  if Dummy:GetAttribute("State") == 1 then x1 else x2
-			local con: RBXScriptConnection
-			con = RunService:BindToSimulation(function()
-				if hasUpdated then
-					con:Disconnect()
-					return
-				end
-
-				if math.abs(root.Position.X - startX) >= half then
-					local t = workspace:GetServerTimeNow()
-					task.defer(function()
-						local currentCount = Dummy:GetAttribute("Count")
-						CountTimes[ Dummy:GetAttribute("Count")] = t
-
-						local oldestCount = currentCount - MAX_SERVER_STAMPS
-						if CountTimes[oldestCount] then
-							CountTimes[oldestCount] = nil
-						end
-					end)
-
-					hasUpdated = true
-					con:Disconnect()
-				end
-			end, Settings.StepFrequency)
-
-			while con.Connected do
-				task.wait()
-			end
-		end
-	end)
-
-	local DT = Settings.LATENCY_DUMMY_STEP_INTERVAL
-
-	task.defer(function()
-		while true do
-			local start = if atStart then position1 else position2
-			local destination = if atStart then position2 else position1
-			root.CFrame = CFrame.lookAt(start, destination)
-			Dummy:SetAttribute("Moving", true)
-			task.wait(DT)
-			humanoid:MoveTo(destination)
-			humanoid.MoveToFinished:Wait()
-			root.AssemblyLinearVelocity = Vector3.zero
-			atStart = not atStart
-			Dummy:SetAttribute("State", if atStart then 1 else 2)
-			task.wait(DT)
-			Dummy:SetAttribute("Moving", false)
-			Dummy:SetAttribute("Count", Dummy:GetAttribute("Count") + 1)
-			task.wait(DT)
-		end
-	end)
-
-	Remote.OnServerEvent:Connect(function(player: Player, count: number, t: number)
-		if typeof(count) ~= "number" or typeof(t) ~= "number" then
+	Remote.OnServerEvent:Connect(function(player: Player, elapsed: number)
+		if typeof(elapsed) ~= "number" or elapsed ~= elapsed or elapsed == math.huge or elapsed < 0 then
 			warn("Invalid latency stamp payload from player: " .. player.Name)
 			return
 		end
 
-		if not CountTimes[count] then
-			warn("Latency stamp expired or invalid for count: " .. tostring(count))
-			return
+		local sample = math.clamp(elapsed, 0, MAX_LATENCY) + LATENCY_OFFSET
 
+		local samples = latencySamples[player]
+		if not samples then
+			samples = {}
+			latencySamples[player] = samples
 		end
 
-		local now = workspace:GetServerTimeNow()
-		if t > now then
-			warn("Latency stamp from the future for player: " .. player.Name)
-			return
+		table.insert(samples, sample)
+		if #samples > LATENCY_SAMPLE_WINDOW then
+			table.remove(samples, 1)
 		end
 
-		local currentLatency = math.clamp(t - CountTimes[count], 0, MAX_LATENCY)
+		local sum = 0
+		for _, value in samples do
+			sum += value
+		end
 
-		player:SetAttribute(LATENCY_ATTRIBUTE, currentLatency * LATENCY_MULTIPLIER)
+		player:SetAttribute(LATENCY_ATTRIBUTE, sum / #samples)
 	end)
 end
 
