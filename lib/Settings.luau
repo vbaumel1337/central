@@ -23,8 +23,20 @@ local Settings = {
     LATENCY_ATTRIBUTE = "PartLatency",
 
     FRAME_CAP = 60,
-    RAYCAST_FRAME_RANGE = 2,
+    RAYCAST_FRAME_RANGE = 1,
     COLLISION_FRAME_RANGE = 1,
+
+    -- how a closest-hit query picks a winner when several frames in range produce a hit
+    -- true  = a hit in a frame nearer the player's estimated index wins outright, regardless of distance
+    -- false = the spatially closest hit across all frames in range wins (ties go to the nearer frame)
+    PREFER_NEAREST_FRAME = true,
+
+    -- seconds between should_rebuild checks on each historical tree. the check is a full scan over
+    -- the tree's nodes, so running it on every frame update is wasteful when the trees stay balanced
+    TREE_REBUILD_CHECK_INTERVAL = 10,
+    -- fraction of the interval used to randomise each tree's next check, on top of the even initial
+    -- stagger, so the trees never drift into checking (and rebuilding) on the same frame
+    TREE_REBUILD_CHECK_JITTER = 0.2,
 
     LATENCY_OFFSET = 0, -- seconds added to the clamped latency measurement before it's stored
     LATENCY_SAMPLE_WINDOW = 5, -- number of recent remote reports averaged into the latency attribute

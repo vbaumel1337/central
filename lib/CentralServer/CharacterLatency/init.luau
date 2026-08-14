@@ -75,8 +75,9 @@ function CharacterLatency.Start()
 	SpinNPC(dummy2)
 
 	Remote.OnServerEvent:Connect(function(player: Player, elapsed: number)
-		if typeof(elapsed) ~= "number" or elapsed ~= elapsed or elapsed == math.huge or elapsed < 0 then
-			warn("Invalid latency stamp payload from player: " .. player.Name)
+		--NaN is dropped rather than clamped: math.clamp propagates it, and a single NaN
+		--sample would poison the averaged attribute and disable rewinding for this player
+		if typeof(elapsed) ~= "number" or elapsed ~= elapsed then
 			return
 		end
 

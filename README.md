@@ -6,19 +6,13 @@ built-in client latency compensation.
 Central keeps a short rolling history of tagged hitbox parts on the server so
 that raycasts/shapecasts issued against a player can be resolved against
 where that player actually saw the world, not just the current frame. It
-uses a small client/server rig that measures each player's round-trip
-latency automatically.
+uses a small client/server rig that measures each player's perceived
+replication delay automatically — see
+[How Character Latency Is Measured](#how-character-latency-is-measured).
 
 Each recorded frame is stored in an AABB tree, and queries against that
 history, raycasts, shapecasts, and overlap checks alike, are resolved with
  collision-detection math, all thanks to the Bolt library; see [Third-party code](#third-party-code).
-
-**Warning**: the per-player latency that drives compensation is measured
-with a fairly hacky trick (see
-[How Character Latency Is Measured](#how-character-latency-is-measured))
-rather than a principled formula, so its accuracy isn't guaranteed to hold
-under every condition. It has held up well in testing so far, but it's
-worth verifying against your own game before relying on it.
 
 ## Installation
 
@@ -55,38 +49,70 @@ Central.Start()
 
 Call `Central.Start()` once, early, on both the server and the client
 (e.g. from your bootstrap scripts) before using any of the query functions
-below.
+below. Calling it more than once, or from the wrong realm, warns and no-ops.
 
 ### API
 
 #### Queries
 
 Every query takes the `player` it's being cast on behalf of (used to
-lag-compensate against) and an optional `querySettings`. On the client
-these are a plain pass-through to their Roblox counterpart; on the server
-they additionally merge in a lag-compensated result.
+lag-compensate against, and to resolve that player's own hitboxes live,
+see [Querying hitboxes](#querying-hitboxes)) and an optional `querySettings`.
+On the client these are a plain pass-through to their Roblox counterpart;
+on the server they additionally merge in a lag-compensated result.
+
+**`Central.Raycast(player, origin, direction, raycastParams?, querySettings?)`**
+counterpart to `workspace:Raycast(origin, direction, raycastParams)`.
+Casts a ray from `origin` in `direction` and returns the closest hit as
+`(distance, instance, position, normal)` instead of a `RaycastResult`.
 
 ```lua
--- counterpart to workspace:Raycast(origin, direction, raycastParams)
 local distance, instance, position, normal =
     Central.Raycast(player, origin, direction, raycastParams)
+```
 
--- counterpart to workspace:Shapecast(part, direction, raycastParams)
+**`Central.Shapecast(player, part, direction, raycastParams?, querySettings?)`**
+counterpart to `workspace:Shapecast(part, direction, raycastParams)`.
+Sweeps `part`'s shape along `direction` and returns the closest hit as
+`(distance, instance, position, normal)`.
+
+```lua
 local distance, instance, position, normal =
     Central.Shapecast(player, part, direction, raycastParams)
+```
 
--- like Shapecast, but skips computing an exact position/normal - cheaper
--- when you only need to know whether and how far along direction a hit occurs
+**`Central.SimpleShapecast(player, part, direction, raycastParams?, querySettings?)`**
+also backed by `workspace:Shapecast` on the live side, but its
+lag-compensated half skips computing an exact contact point/normal, only
+checking whether and how far along `direction` a hit occurs. Cheaper than
+`Shapecast` when you don't need the hit position.
+
+```lua
 local distance, instance =
     Central.SimpleShapecast(player, part, direction, raycastParams)
+```
 
--- counterpart to workspace:GetPartBoundsInRadius(position, radius, overlapParams)
+**`Central.GetBoundsInRadius(player, position, radius, overlapParams?, querySettings?)`**
+counterpart to `workspace:GetPartBoundsInRadius(position, radius, overlapParams)`.
+Returns `{BasePart}` overlapping a sphere of `radius` at `position`.
+
+```lua
 local parts = Central.GetBoundsInRadius(player, position, radius, overlapParams)
+```
 
--- counterpart to workspace:GetPartBoundsInBox(cframe, size, overlapParams)
+**`Central.GetPartBoundsInBox(player, cframe, size, overlapParams?, querySettings?)`**
+counterpart to `workspace:GetPartBoundsInBox(cframe, size, overlapParams)`.
+Returns `{BasePart}` overlapping an oriented box.
+
+```lua
 local parts = Central.GetPartBoundsInBox(player, cframe, size, overlapParams)
+```
 
--- counterpart to workspace:GetPartsInPart(part, overlapParams)
+**`Central.GetPartsInPart(player, part, overlapParams?, querySettings?)`**
+counterpart to `workspace:GetPartsInPart(part, overlapParams)`. Returns
+`{BasePart}` overlapping `part`'s own shape and position.
+
+```lua
 local parts = Central.GetPartsInPart(player, part, overlapParams)
 ```
 
@@ -96,47 +122,93 @@ Server-only calls for registering the two collision-group families
 described in
 [Creating and Querying a Lag-compensated Hitbox](#creating-and-querying-a-lag-compensated-hitbox).
 Under the hood these wrap `PhysicsService:RegisterCollisionGroup` and
-`PhysicsService:CollisionGroupSetCollidable`. `Settings.INITIAL_COLLISION_GROUPS`/
-`Settings.INITIAL_QUERY_GROUPS` are registered automatically by
-`Central.Start()`.
+`PhysicsService:CollisionGroupSetCollidable`.
+
+**`Central.AddCollisionGroup(name)`** registers `name` as a hitbox
+collision group: creates the `PhysicsService` group if it doesn't exist
+yet, and sets it non-collidable with every group already registered via
+`AddQueryGroup`. A tagged hitbox part whose `CollisionGroup` isn't a
+registered hitbox group gets forced onto
+`Settings.DEFAULT_HITBOX_COLLISIONGROUP` instead.
 
 ```lua
--- registers "EnemyHitbox" as a hitbox group, non-collidable with every
--- registered query group; use as a tagged hitbox part's CollisionGroup
 Central.AddCollisionGroup("EnemyHitbox")
+```
 
--- reverses AddCollisionGroup: restores collidability, stops treating it as a hitbox group
+**`Central.RemoveCollisionGroup(name)`** reverses that: restores
+collidability between `name` and every registered query group, and stops
+treating `name` as a hitbox group.
+
+```lua
 Central.RemoveCollisionGroup("EnemyHitbox")
+```
 
--- registers "EnemyQuery" as a query group, non-collidable with every
--- registered hitbox group; use as a query's RaycastParams/OverlapParams.CollisionGroup
+**`Central.AddQueryGroup(name)`** registers `name` as a query collision
+group: creates the `PhysicsService` group if needed, and sets it
+non-collidable with every registered hitbox group. Pass it as
+`CollisionGroup` on the `RaycastParams`/`OverlapParams` you give to the
+query functions above.
+
+```lua
 Central.AddQueryGroup("EnemyQuery")
+```
 
--- reverses AddQueryGroup: restores collidability, stops treating it as a query group
+**`Central.RemoveQueryGroup(name)`** reverses that: restores
+collidability with every registered hitbox group, and stops treating
+`name` as a query group. As with `RemoveCollisionGroup`, the underlying
+`PhysicsService` group is left registered rather than unregistered.
+
+```lua
 Central.RemoveQueryGroup("EnemyQuery")
 ```
 
+`Settings.INITIAL_COLLISION_GROUPS`/`Settings.INITIAL_QUERY_GROUPS` are
+registered automatically by `Central.Start()`; by default each just
+contains `Settings.DEFAULT_HITBOX_COLLISIONGROUP`/
+`Settings.DEFAULT_HITBOX_QUERY_GROUP`.
+
 #### Debug Hitbox Visualization (server only)
 
-Only active when `Settings.DEBUG_MODE` is `true`. Drawing uses the same visualizer as `DEBUG_MODE`'s query draws, except these persist until
-explicitly hidden. All four clean up automatically on
-`Players.PlayerRemoving`.
+Only active when `Settings.DEBUG_MODE` is `true`; otherwise these are
+no-ops with zero added per-frame cost. When on, drawing happens via the
+same vendored Bolt visualizer used for `DEBUG_MODE`'s query draws (see
+[Settings](#settings)), except these persist frame after frame instead of
+decaying, until explicitly hidden.
+
+**`Central.ShowHitboxes(player, owner)`** continuously draws `owner`'s
+hitboxes at the historical frame `player` is currently lag-compensated
+against, i.e. exactly what Central resolves `player`'s queries against.
+`owner` is a player's `Name`, or `"Server"` for hitboxes with no
+`Settings.OWNER_ATTRIBUTE` set. Safe to call again with a different
+`owner` for the same `player`, both draw at once.
 
 ```lua
--- continuously draws "SomeEnemy"'s hitboxes at the historical frame `player`
--- is currently lag-compensated against, i.e. what player's queries resolve against
 Central.ShowHitboxes(player, "SomeEnemy")
+```
 
--- stops the draw started by ShowHitboxes for that (player, owner) pair
+**`Central.HideHitboxes(player, owner)`** stops the draw started by
+`ShowHitboxes` for that `(player, owner)` pair.
+
+```lua
 Central.HideHitboxes(player, "SomeEnemy")
+```
 
--- like ShowHitboxes, but for every other connected player plus "Server"-owned
--- hitboxes at once, recomputed live each frame
+**`Central.ShowAllPlayerHitboxes(player)`** like `ShowHitboxes`, but for
+every other connected player plus `"Server"`-owned hitboxes at once,
+recomputed live each frame so joins/leaves are picked up automatically.
+
+```lua
 Central.ShowAllPlayerHitboxes(player)
+```
 
--- stops the draw started by ShowAllPlayerHitboxes for player
+**`Central.RemoveAllPlayerHitboxes(player)`** stops the draw started by
+`ShowAllPlayerHitboxes` for `player`.
+
+```lua
 Central.RemoveAllPlayerHitboxes(player)
 ```
+
+All four clean up automatically on `Players.PlayerRemoving`.
 
 ## Creating and Querying a Lag-compensated Hitbox
 
@@ -279,39 +351,53 @@ since jitter and latency variance keep it approximate.
 ## How Character Latency Is Measured
 
 Central doesn't rely on raw network ping for `Settings.LATENCY_ATTRIBUTE`.
-Instead it measures the actual delay in what a client sees, using a fairly
-hacky trick: a hidden NPC, tucked far out of the way, walks back and forth
-between two fixed points forever, pausing briefly at each end. The walk is
-completely deterministic and replicates to every client like any other part.
+Instead it measures the delay directly, by making the client compare two
+copies of the same motion against each other.
 
-Both the server and every client independently watch that walk, every
-simulation step, for the exact moment the NPC crosses the walk's midpoint,
-a simple, unambiguous event to detect. The server timestamps the moment
-*it* sees that crossing (ground truth). Each client, watching its own
-replicated copy of the NPC, sees the same crossing sometime later, and
-reports that delay back to the server over a `RemoteEvent`. The gap between
-the two timestamps is how far behind that player's view of the world
-actually is, capturing the real, perceived replication delay (including
-Roblox's own part-interpolation buffering), not just round-trip ping.
+The server keeps a hidden rig — two humanoid dummies on a platform, parked
+far out of the playable area at `Settings.LATENCY_DUMMY_HIDE_OFFSET`. Both
+dummies walk a continuous circle of radius `Settings.LATENCY_ORBIT_RADIUS`
+around a shared centre point. The orbit is deterministic and runs on the
+server and on every client alike, so each client is simulating the same
+motion the server is.
 
-That measured delay is then multiplied by `Settings.LATENCY_MULTIPLIER`
-before being written to the player's `Settings.LATENCY_ATTRIBUTE`, which is
-the number Central actually rewinds hitbox history by. The multiplier
-(`1.42` by default) isn't derived from anything, it's a number found
-by trial and error until the numbers lined up.
-```lua
-LATENCY_MULTIPLIER = 1.42, -- this number was releaved to me in a dream
-```
+The two dummies differ in exactly one way. On the client, one has
+`RunService:SetPredictionMode` set to `On` and the other to `Off`. The
+predicted dummy is reconciled against the client's own local simulation, so
+it tracks where the client *believes* the world is right now. The delayed
+dummy shows raw replicated state, so it tracks where the server's last
+received update actually put it. Circular motion turns the gap between them
+into an angle.
 
-If your own testing shows compensation consistently running ahead of or
-behind what players actually see, try changing `Settings.LATENCY_MULTIPLIER` 
+Each measurement cycle, the client records the predicted dummy's current
+angle, then waits for the delayed dummy to sweep around to that same angle —
+either landing inside `Settings.LATENCY_ANGLE_EPSILON` of it, or crossing
+past it between two frames. The time that takes is how far behind the
+player's replicated view is running. That captures real perceived
+replication delay, including Roblox's own part-interpolation buffering,
+rather than round-trip ping. A cycle that never converges is abandoned after
+`Settings.LATENCY_MEASURE_TIMEOUT`, and there's a
+`Settings.LATENCY_MEASURE_PAUSE` gap between cycles.
 
-**Warning**: because this rests on a fixed multiplier tuned against one set
-of conditions rather than a derived formula, it's entirely possible for it
-to drift out of accuracy under different conditions (network profile,
-server tick rate, physics load, etc.). In testing so far it has held up
-well, but it isn't a guarantee, keep an eye on it rather than assuming
-it'll stay correct forever.
+The client reports each result over a `RemoteEvent`. The server discards
+non-numbers and `NaN`, clamps the value into `[0, Settings.MAX_LATENCY]`,
+adds `Settings.LATENCY_OFFSET`, and averages the last
+`Settings.LATENCY_SAMPLE_WINDOW` samples. That mean is what gets written to
+the player's `Settings.LATENCY_ATTRIBUTE`, and it's the number Central
+rewinds hitbox history by.
+
+Two things worth knowing:
+
+- **The measurement is client-reported.** The server sanity-checks and
+  clamps it, but does not independently verify it, so a modified client can
+  influence how far back its own shots are rewound — bounded by
+  `MAX_LATENCY`. If that matters for your game, treat `MAX_LATENCY` as the
+  security-relevant knob.
+- **`LATENCY_OFFSET` is applied after the clamp**, so a non-zero value can
+  push the stored latency outside `[0, MAX_LATENCY]`. Going beyond
+  `MAX_LATENCY` asks Central to rewind further than the history buffer
+  reaches, which resolves to the current frame instead — quietly disabling
+  compensation for that player rather than erroring.
 
 ## Settings
 
@@ -335,11 +421,23 @@ way to change a default.
 | `INITIAL_COLLISION_GROUPS` | `{DEFAULT_HITBOX_COLLISIONGROUP}` | Hitbox groups registered automatically by `Central.Start()`, equivalent to calling `Central.AddCollisionGroup` for each. |
 | `HITBOX_TAG` | `"CompensatedHitbox"` | The `CollectionService` tag that marks a `BasePart` as lag-compensated — see [Creating a hitbox](#creating-a-hitbox). |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name` — see [Creating a hitbox](#creating-a-hitbox). |
-| `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's measured, multiplied latency to — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged measured latency to — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
 | `FRAME_CAP` | `60` | Size of the hitbox/time history ring buffer. Combined with `StepFrequency`, this bounds how far back Central can rewind (60 frames at 60 Hz ≈ 1 second by default). |
-| `RAYCAST_FRAME_RANGE` | `2` | Default `querySettings.frameRange` for `Central.Raycast`. |
+| `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Central.Raycast`. |
 | `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/the overlap functions. |
-| `LATENCY_MULTIPLIER` | `1.42` | Empirically-tuned factor applied to measured latency before it's written to `LATENCY_ATTRIBUTE` — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `PREFER_NEAREST_FRAME` | `true` | How a closest-hit query picks a winner when several frames in `frameRange` produce a hit. `true`: a hit in a frame nearer the player's rewound index wins outright, regardless of distance. `false`: the spatially closest hit across the whole range wins, ties going to the nearer frame. |
+| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. The check scans every node, so running it on each frame update is wasteful while the trees stay balanced. |
+| `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomise each tree's next check, on top of an even initial stagger, so the trees never come due on the same frame. |
+| `LATENCY_OFFSET` | `0` | Seconds added to each clamped latency sample before it's averaged. Applied *after* the clamp — see the caveat in [How Character Latency Is Measured](#how-character-latency-is-measured). |
+| `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. Higher is steadier but slower to react to a change in a player's connection. |
+| `MAX_LATENCY` | `1` | Upper clamp (seconds) on a client-reported latency sample. Matches the history buffer's span (`FRAME_CAP` / `StepFrequency`), and bounds how far a modified client could push its own rewind. |
+| `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the measurement rig is parked, out of the playable map. |
+| `LATENCY_ORBIT_RADIUS` | `25` | Radius (studs) of the circle the two latency dummies walk. |
+| `LATENCY_ANGLE_EPSILON` | `math.rad(0.1)` | How close the delayed dummy's angle must get to the predicted dummy's recorded angle to count as having caught up. |
+| `LATENCY_MEASURE_TIMEOUT` | `1` | Seconds before an unconverged measurement cycle is abandoned. |
+| `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds to wait between measurement cycles. |
+| `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a hitbox flush against world geometry still registers. |
+| `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
 | `AABB_PADDING` | `1` | Padding (in studs) added around each hitbox's bounding box in the per-frame AABB tree, giving queries slack before the tree needs a partial rebuild as parts move. |
 
 ## Third-party code

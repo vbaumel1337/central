@@ -114,7 +114,7 @@ function CentralClient.Start()
 
 		if withinMargin or crossed then
 			local elapsed = now - startTime
-			Remote:FireServer(elapsed - 1 / 60)
+			Remote:FireServer(elapsed)
 
 			measuring = false
 			nextMeasureTime = now + PAUSE_BETWEEN_MEASUREMENTS

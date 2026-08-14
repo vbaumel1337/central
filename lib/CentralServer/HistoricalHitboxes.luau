@@ -9,9 +9,22 @@ local PartRegister = require(script.Parent.Registers.PartRegister)
 
 local gjk = bolt.dispatch.gjk
 local collision = bolt.collision
-local shapeMap = bolt.shape_map
+local shapeMap = require(script.Parent.Parent.bolt.shape_map)
 
 local GJK_TOLERANCE = Settings.GJK_TOLERANCE
+local PREFER_NEAREST_FRAME = Settings.PREFER_NEAREST_FRAME
+local TREE_REBUILD_CHECK_INTERVAL = Settings.TREE_REBUILD_CHECK_INTERVAL
+local TREE_REBUILD_CHECK_JITTER = Settings.TREE_REBUILD_CHECK_INTERVAL * Settings.TREE_REBUILD_CHECK_JITTER
+
+--own generator, so staggering the trees never disturbs the global math.random sequence
+local rng = Random.new()
+
+--the closest-hit tree queries work in fractions of the cast, not studs, so narrow phase
+--distances get scaled by this. a zero length sweep collapses every hit onto fraction 0.
+local function fractionScale(direction: Vector3): number
+	local length = direction.Magnitude
+	return if length > 0 then 1 / length else 0
+end
 
 export type Hitbox = {
 	id: number,
@@ -36,6 +49,7 @@ export type HistoricalHitboxes = typeof(setmetatable(
 		frameCap: number,
 		padding: number,
 		trees: {[number]: bolt.DynamicTree},
+		nextRebuildCheck: {[number]: number},
 		hitboxes: {[number]: {[number]: Hitbox}},
 		parts: {[BasePart]: PartInfo},
 		partList: {PartInfo},
@@ -100,14 +114,18 @@ function HistoricalHitboxes.new(frameCap: number, padding: number): HistoricalHi
 	self.frameCap = frameCap
 	self.padding = padding
 	self.trees = {}
+	self.nextRebuildCheck = {}
 	self.hitboxes = {}
 	self.parts = {}
 	self.partList = {}
 	self.nextPartId = 0
 
+	local now = os.clock()
 	for index = 1, frameCap do
 		self.trees[index] = bolt.aabb_tree.new({aabb_padding = padding})
 		self.hitboxes[index] = {}
+		--first check is spread evenly across the interval so the trees don't all come due together
+		self.nextRebuildCheck[index] = now + TREE_REBUILD_CHECK_INTERVAL * (index - 1) / frameCap
 	end
 
 	return self
@@ -194,45 +212,81 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 		end
 	end
 
-	if tree:should_rebuild() then
-		tree:partial_rebuild()
+	--should_rebuild is a full scan over the tree's nodes, so each tree only checks on its own
+	--schedule. the jitter keeps the trees from drifting into checking on the same frame.
+	local now = os.clock()
+	if now >= self.nextRebuildCheck[index] then
+		self.nextRebuildCheck[index] = now + TREE_REBUILD_CHECK_INTERVAL
+			+ rng:NextNumber(-TREE_REBUILD_CHECK_JITTER, TREE_REBUILD_CHECK_JITTER)
+
+		if tree:should_rebuild() then
+			tree:partial_rebuild()
+		end
 	end
 end
 
 function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
 	local playerName = player.Name
-	local minDistance = math.huge
-	local minOffset = math.huge
-	local resultHitbox: Hitbox? = nil
-	local resultPoint: Vector3? = nil
-	local resultDistance: number? = nil
-	local resultNormal: Vector3? = nil
+	local invLength = fractionScale(rayDirection)
 
-	for offset = -frameRange, frameRange do
+	local bestDistance = math.huge
+	local bestHitbox: Hitbox? = nil
+	local bestPoint: Vector3? = nil
+	local bestNormal: Vector3? = nil
+	local bestOffset = 0
+
+	local function queryFrame(offset: number)
 		local index = wrapIndex(centerIndex + offset, self.frameCap)
 		local frameHitboxes = self.hitboxes[index]
-		for _, id in self.trees[index]:query_ray(rayOrigin, rayDirection) do
+		--anything the cast reaches after the current best is pruned before its narrow phase runs
+		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
+
+		self.trees[index]:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
 			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
-				continue
+				return nil
 			end
 
 			local hitPoint, distance, hitNormal = bolt.raycast.box(rayOrigin, rayDirection, hitbox.cframe, hitbox.shape)
-			local absOffset = math.abs(offset)
-			if distance and (distance < minDistance or absOffset < minOffset) then
-				minDistance = distance
-				minOffset = absOffset
-				local clonedHitbox = table.clone(hitbox)
-				clonedHitbox.frameOffset = offset
-				resultHitbox = clonedHitbox
-				resultPoint = hitPoint :: Vector3
-				resultDistance = distance
-				resultNormal = hitNormal :: Vector3
+			if distance == nil then
+				return nil
 			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestPoint = hitPoint
+				bestNormal = hitNormal
+				bestOffset = offset
+			end
+
+			return distance * invLength
+		end, maxFraction)
+	end
+
+	--walk outward from the player's estimated frame, so the nearest frame is always resolved first
+	for absOffset = 0, frameRange do
+		if absOffset == 0 then
+			queryFrame(0)
+		else
+			queryFrame(-absOffset)
+			queryFrame(absOffset)
+		end
+
+		--both peers in the band are compared before stopping, so equal offsets resolve by distance
+		if PREFER_NEAREST_FRAME and bestHitbox then
+			break
 		end
 	end
 
-	return resultHitbox, resultPoint, resultDistance, resultNormal
+	if not bestHitbox then
+		return nil, nil, nil, nil
+	end
+
+	local resultHitbox = table.clone(bestHitbox :: Hitbox)
+	resultHitbox.frameOffset = bestOffset
+
+	return resultHitbox, bestPoint, bestDistance, bestNormal
 end
 
 function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
@@ -241,38 +295,63 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 	end
 
 	local playerName = player.Name
-	local minDistance = math.huge
-	local minOffset = math.huge
-	local resultHitbox: Hitbox? = nil
-	local resultPoint: Vector3? = nil
-	local resultDistance: number? = nil
-	local resultNormal: Vector3? = nil
+	local invLength = fractionScale(direction)
 
-	for offset = -frameRange, frameRange do
+	local bestDistance = math.huge
+	local bestHitbox: Hitbox? = nil
+	local bestPoint: Vector3? = nil
+	local bestNormal: Vector3? = nil
+	local bestOffset = 0
+
+	local function queryFrame(offset: number)
 		local index = wrapIndex(centerIndex + offset, self.frameCap)
 		local frameHitboxes = self.hitboxes[index]
-		for _, id in self.trees[index]:query_shapecast(shape, cframe, direction) do
+		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
+
+		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
-				continue
+				return nil
 			end
 
 			local hitPoint, distance, hitNormal = gjk.shapecast(cframe, direction, shape, hitbox.cframe, hitbox.shape, GJK_TOLERANCE)
-			local absOffset = math.abs(offset)
-			if distance and (distance < minDistance or absOffset < minOffset) then
-				minDistance = distance
-				minOffset = absOffset
-				local clonedHitbox = table.clone(hitbox)
-				clonedHitbox.frameOffset = offset
-				resultHitbox = clonedHitbox
-				resultPoint = hitPoint :: Vector3
-				resultDistance = distance
-				resultNormal = hitNormal :: Vector3
+			if distance == nil then
+				return nil
 			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestPoint = hitPoint
+				bestNormal = hitNormal
+				bestOffset = offset
+			end
+
+			return distance * invLength
+		end, maxFraction)
+	end
+
+	for absOffset = 0, frameRange do
+		if absOffset == 0 then
+			queryFrame(0)
+		else
+			queryFrame(-absOffset)
+			queryFrame(absOffset)
+		end
+
+		if PREFER_NEAREST_FRAME and bestHitbox then
+			break
 		end
 	end
 
-	return resultHitbox, resultPoint, resultDistance, resultNormal
+	if not bestHitbox then
+		return nil, nil, nil, nil
+	end
+
+	local resultHitbox = table.clone(bestHitbox :: Hitbox)
+	resultHitbox.frameOffset = bestOffset
+
+	return resultHitbox, bestPoint, bestDistance, bestNormal
 end
 
 function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, number?)
@@ -281,34 +360,59 @@ function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, playe
 	end
 
 	local playerName = player.Name
-	local minDistance = math.huge
-	local minOffset = math.huge
-	local resultHitbox: Hitbox? = nil
-	local resultDistance: number? = nil
+	local invLength = fractionScale(direction)
 
-	for offset = -frameRange, frameRange do
+	local bestDistance = math.huge
+	local bestHitbox: Hitbox? = nil
+	local bestOffset = 0
+
+	local function queryFrame(offset: number)
 		local index = wrapIndex(centerIndex + offset, self.frameCap)
 		local frameHitboxes = self.hitboxes[index]
-		for _, id in self.trees[index]:query_shapecast(shape, cframe, direction) do
+		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
+
+		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
-				continue
+				return nil
 			end
 
 			local hit, distance = gjk.shapecast_simple(cframe, direction, shape, hitbox.cframe, hitbox.shape, GJK_TOLERANCE)
-			local absOffset = math.abs(offset)
-			if hit and distance and (distance < minDistance or absOffset < minOffset) then
-				minDistance = distance
-				minOffset = absOffset
-				local clonedHitbox = table.clone(hitbox)
-				clonedHitbox.frameOffset = offset
-				resultHitbox = clonedHitbox
-				resultDistance = distance
+			if not hit or distance == nil then
+				return nil
 			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestOffset = offset
+			end
+
+			return distance * invLength
+		end, maxFraction)
+	end
+
+	for absOffset = 0, frameRange do
+		if absOffset == 0 then
+			queryFrame(0)
+		else
+			queryFrame(-absOffset)
+			queryFrame(absOffset)
+		end
+
+		if PREFER_NEAREST_FRAME and bestHitbox then
+			break
 		end
 	end
 
-	return resultHitbox, resultDistance
+	if not bestHitbox then
+		return nil, nil
+	end
+
+	local resultHitbox = table.clone(bestHitbox :: Hitbox)
+	resultHitbox.frameOffset = bestOffset
+
+	return resultHitbox, bestDistance
 end
 
 local function collides(hitbox: Hitbox, cframe: CFrame, shape: bolt.Shape): boolean
