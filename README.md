@@ -4,15 +4,13 @@ Server-authoritative hitbox, raycast, and shapecast querying for Roblox, with
 built-in client latency compensation.
 
 Central keeps a short rolling history of tagged hitbox parts on the server so
-that raycasts/shapecasts issued against a player can be resolved against
-where that player actually saw the world, not just the current frame. It
-uses a small client/server rig that measures each player's perceived
-replication delay automatically — see
-[How Character Latency Is Measured](#how-character-latency-is-measured).
-
-Each recorded frame is stored in an AABB tree, and queries against that
-history, raycasts, shapecasts, and overlap checks alike, are resolved with
- collision-detection math, all thanks to the Bolt library; see [Third-party code](#third-party-code).
+that raycasts/shapecasts issued against a player are resolved against where
+that player actually saw the world, not just the current frame. It measures
+each player's perceived replication delay automatically (see
+[How Character Latency Is Measured](#how-character-latency-is-measured)) and
+rewinds hitbox history to match. Queries are resolved against an AABB tree
+per historical frame, using the [Bolt](https://github.com/unityjaeger/Bolt)
+library for the collision-detection math.
 
 ## Installation
 
@@ -20,7 +18,7 @@ Add to your `wally.toml`:
 
 ```toml
 [dependencies]
-Central = "vbaumel1337/central@^0.1.5"
+Central = "vbaumel1337/central@^0.2.0"
 ```
 
 Then `wally install`.
@@ -28,290 +26,126 @@ Then `wally install`.
 ## Examples
 
 A runnable example place is included at
-[`examples/Server Authoritative Hitboxes Demo.rbxl`](<examples/Server Authoritative Hitboxes Demo.rbxl>).
-
-**Commands**: F fires an projectile, E fires an laser gun, Q does a super jump.
-
-This game will throw errors and lag sometimes due to roblox's instance sitching being very buggy at the moment.
-
-It's also playable and copyable live on Roblox:
+[`examples/Server Authoritative Hitboxes Demo.rbxl`](<examples/Server Authoritative Hitboxes Demo.rbxl>),
+and playable live on Roblox:
 [Server-Authoritative Hitboxes Demo](https://www.roblox.com/games/92062322926252/Server-Authoritative-Hitboxes-Demo).
+
+**Commands**: F fires a projectile, E fires a laser gun, Q does a super jump.
+(This game can lag/error occasionally, since Roblox's instance streaming is
+buggy right now.)
 
 ## Usage
 
-Central is a single module required from both the server and the client;
-it gates its own behavior based on `RunService`.
+Central is a single module required from both the server and the client; it
+gates its own behavior based on `RunService`. Call `Central.Start()` once,
+early, on both realms, before using any of the functions below. Calling it
+twice, or from the wrong realm, warns and no-ops.
 
 ```lua
 local Central = require(ReplicatedStorage.Packages.Central)
 Central.Start()
 ```
 
-Call `Central.Start()` once, early, on both the server and the client
-(e.g. from your bootstrap scripts) before using any of the query functions
-below. Calling it more than once, or from the wrong realm, warns and no-ops.
-
-### API
-
-#### Queries
+### Queries
 
 Every query takes the `player` it's being cast on behalf of (used to
-lag-compensate against, and to resolve that player's own hitboxes live,
-see [Querying hitboxes](#querying-hitboxes)) and an optional `querySettings`.
-On the client these are a plain pass-through to their Roblox counterpart;
-on the server they additionally merge in a lag-compensated result.
-
-**`Central.Raycast(player, origin, direction, raycastParams?, querySettings?)`**
-counterpart to `workspace:Raycast(origin, direction, raycastParams)`.
-Casts a ray from `origin` in `direction` and returns the closest hit as
-`(distance, instance, position, normal)` instead of a `RaycastResult`.
+lag-compensate against, and to resolve that player's own hitboxes live) and
+an optional `querySettings`. On the client these are a plain pass-through to
+their Roblox counterpart, no compensation happens. On the server, each call
+runs a normal **live** query against the world right now plus a
+**historical** query against that player's rewound hitbox history, and
+merges them: the cast functions return whichever hit is closer, the overlap
+functions union both result sets.
 
 ```lua
-local distance, instance, position, normal =
-    Central.Raycast(player, origin, direction, raycastParams)
+Central.Raycast(player, origin, direction, raycastParams?, querySettings?)          -- workspace:Raycast               -> distance, instance, position, normal
+Central.Shapecast(player, part, direction, raycastParams?, querySettings?)          -- workspace:Shapecast             -> distance, instance, position, normal
+Central.SimpleShapecast(player, part, direction, raycastParams?, querySettings?)    -- workspace:Shapecast, cheaper    -> distance, instance
+Central.GetBoundsInRadius(player, position, radius, overlapParams?, querySettings?) -- workspace:GetPartBoundsInRadius -> {BasePart}
+Central.GetPartBoundsInBox(player, cframe, size, overlapParams?, querySettings?)    -- workspace:GetPartBoundsInBox    -> {BasePart}
+Central.GetPartsInPart(player, part, overlapParams?, querySettings?)                -- workspace:GetPartsInPart        -> {BasePart}
 ```
 
-**`Central.Shapecast(player, part, direction, raycastParams?, querySettings?)`**
-counterpart to `workspace:Shapecast(part, direction, raycastParams)`.
-Sweeps `part`'s shape along `direction` and returns the closest hit as
-`(distance, instance, position, normal)`.
+Only these `RaycastParams`/`OverlapParams` properties are honored:
+`CollisionGroup`, `RespectCanCollide`, `ExcludeInstances`,
+`IncludeInstances`, and (overlap only) `MaxParts`.
+
+`querySettings` (server only): `{ frameRange: number?, check: ((BasePart) -> boolean)? }`
+- `frameRange`: extra frames around the player's latency-resolved frame to
+  search. Defaults to `Settings.RAYCAST_FRAME_RANGE` for `Raycast`,
+  `Settings.COLLISION_FRAME_RANGE` for the rest.
+- `check`: a `(part: BasePart) -> boolean` filter for candidate hits. On
+  `Raycast`/`Shapecast`/`SimpleShapecast` it also makes the live cast pierce
+  through failing parts instead of stopping on them.
+
+### Collision group registration (server only)
+
+Central keeps hitbox parts and queries in two separate, always mutually
+non-collidable, families of `PhysicsService` collision group: a **hitbox**
+group (for the parts) never collides with a **query** group (for the
+casts). That's what lets a live query skip right past a hitbox part instead
+of hitting its current position; the historical pass is what checks
+hitboxes.
 
 ```lua
-local distance, instance, position, normal =
-    Central.Shapecast(player, part, direction, raycastParams)
+Central.AddCollisionGroup(name)    -- registers a hitbox group, non-collidable with every query group
+Central.RemoveCollisionGroup(name) -- reverses that; leaves the PhysicsService group registered
+Central.AddQueryGroup(name)        -- registers a query group, non-collidable with every hitbox group
+Central.RemoveQueryGroup(name)     -- reverses that; leaves the PhysicsService group registered
 ```
 
-**`Central.SimpleShapecast(player, part, direction, raycastParams?, querySettings?)`**
-also backed by `workspace:Shapecast` on the live side, but its
-lag-compensated half skips computing an exact contact point/normal, only
-checking whether and how far along `direction` a hit occurs. Cheaper than
-`Shapecast` when you don't need the hit position.
-
-```lua
-local distance, instance =
-    Central.SimpleShapecast(player, part, direction, raycastParams)
-```
-
-**`Central.GetBoundsInRadius(player, position, radius, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartBoundsInRadius(position, radius, overlapParams)`.
-Returns `{BasePart}` overlapping a sphere of `radius` at `position`.
-
-```lua
-local parts = Central.GetBoundsInRadius(player, position, radius, overlapParams)
-```
-
-**`Central.GetPartBoundsInBox(player, cframe, size, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartBoundsInBox(cframe, size, overlapParams)`.
-Returns `{BasePart}` overlapping an oriented box.
-
-```lua
-local parts = Central.GetPartBoundsInBox(player, cframe, size, overlapParams)
-```
-
-**`Central.GetPartsInPart(player, part, overlapParams?, querySettings?)`**
-counterpart to `workspace:GetPartsInPart(part, overlapParams)`. Returns
-`{BasePart}` overlapping `part`'s own shape and position.
-
-```lua
-local parts = Central.GetPartsInPart(player, part, overlapParams)
-```
-
-#### Collision Group Registration (server only)
-
-Server-only calls for registering the two collision-group families
-described in
-[Creating and Querying a Lag-compensated Hitbox](#creating-and-querying-a-lag-compensated-hitbox).
-Under the hood these wrap `PhysicsService:RegisterCollisionGroup` and
-`PhysicsService:CollisionGroupSetCollidable`.
-
-**`Central.AddCollisionGroup(name)`** registers `name` as a hitbox
-collision group: creates the `PhysicsService` group if it doesn't exist
-yet, and sets it non-collidable with every group already registered via
-`AddQueryGroup`. A tagged hitbox part whose `CollisionGroup` isn't a
-registered hitbox group gets forced onto
-`Settings.DEFAULT_HITBOX_COLLISIONGROUP` instead.
-
-```lua
-Central.AddCollisionGroup("EnemyHitbox")
-```
-
-**`Central.RemoveCollisionGroup(name)`** reverses that: restores
-collidability between `name` and every registered query group, and stops
-treating `name` as a hitbox group.
-
-```lua
-Central.RemoveCollisionGroup("EnemyHitbox")
-```
-
-**`Central.AddQueryGroup(name)`** registers `name` as a query collision
-group: creates the `PhysicsService` group if needed, and sets it
-non-collidable with every registered hitbox group. Pass it as
-`CollisionGroup` on the `RaycastParams`/`OverlapParams` you give to the
-query functions above.
-
-```lua
-Central.AddQueryGroup("EnemyQuery")
-```
-
-**`Central.RemoveQueryGroup(name)`** reverses that: restores
-collidability with every registered hitbox group, and stops treating
-`name` as a query group. As with `RemoveCollisionGroup`, the underlying
-`PhysicsService` group is left registered rather than unregistered.
-
-```lua
-Central.RemoveQueryGroup("EnemyQuery")
-```
-
-`Settings.INITIAL_COLLISION_GROUPS`/`Settings.INITIAL_QUERY_GROUPS` are
-registered automatically by `Central.Start()`; by default each just
-contains `Settings.DEFAULT_HITBOX_COLLISIONGROUP`/
-`Settings.DEFAULT_HITBOX_QUERY_GROUP`.
-
-#### Debug Hitbox Visualization (server only)
-
-Only active when `Settings.DEBUG_MODE` is `true`; otherwise these are
-no-ops with zero added per-frame cost. When on, drawing happens via the
-same vendored Bolt visualizer used for `DEBUG_MODE`'s query draws (see
-[Settings](#settings)), except these persist frame after frame instead of
-decaying, until explicitly hidden.
-
-**`Central.ShowHitboxes(player, owner)`** continuously draws `owner`'s
-hitboxes at the historical frame `player` is currently lag-compensated
-against, i.e. exactly what Central resolves `player`'s queries against.
-`owner` is a player's `Name`, or `"Server"` for hitboxes with no
-`Settings.OWNER_ATTRIBUTE` set. Safe to call again with a different
-`owner` for the same `player`, both draw at once.
-
-```lua
-Central.ShowHitboxes(player, "SomeEnemy")
-```
-
-**`Central.HideHitboxes(player, owner)`** stops the draw started by
-`ShowHitboxes` for that `(player, owner)` pair.
-
-```lua
-Central.HideHitboxes(player, "SomeEnemy")
-```
-
-**`Central.ShowAllPlayerHitboxes(player)`** like `ShowHitboxes`, but for
-every other connected player plus `"Server"`-owned hitboxes at once,
-recomputed live each frame so joins/leaves are picked up automatically.
-
-```lua
-Central.ShowAllPlayerHitboxes(player)
-```
-
-**`Central.RemoveAllPlayerHitboxes(player)`** stops the draw started by
-`ShowAllPlayerHitboxes` for `player`.
-
-```lua
-Central.RemoveAllPlayerHitboxes(player)
-```
-
-All four clean up automatically on `Players.PlayerRemoving`.
-
-## Creating and Querying a Lag-compensated Hitbox
-
-Central keeps hitbox parts and queries in two separate families of
-collision group, and always keeps those two families non-collidable with
-each other: a **hitbox** group (for the parts) never collides with a
-**query** group (for the casts). That's what lets a live query skip right
-past a hitbox part instead of hitting its current position, the
-historical (rewound) pass is what's responsible for checking hitboxes.
+A tagged hitbox part or query whose `CollisionGroup` isn't a registered
+hitbox/query group is silently forced onto
+`Settings.DEFAULT_HITBOX_COLLISIONGROUP` / `Settings.DEFAULT_HITBOX_QUERY_GROUP`.
+`Settings.INITIAL_COLLISION_GROUPS` / `Settings.INITIAL_QUERY_GROUPS`
+(default: just those two) are registered automatically by `Central.Start()`.
 
 ### Creating a hitbox
 
 Tag a `BasePart` with `Settings.HITBOX_TAG` (`"CompensatedHitbox"` by
 default) to have the server start recording its `CFrame`, size, and
-`CanCollide` every frame:
+`CanCollide` every frame. Set the attribute and collision group *before*
+adding the tag. Central only reads them once, at the moment the tag is
+added:
 
 ```lua
 -- server
 part:SetAttribute(Settings.OWNER_ATTRIBUTE, player.Name) -- optional
-part.CollisionGroup = "EnemyHitbox" -- must already be registered, see below
+part.CollisionGroup = "EnemyHitbox" -- must already be registered
 part:AddTag(Settings.HITBOX_TAG)
 ```
 
-Set the attribute and collision group *before* adding the tag, Central
-only reads them once, at the moment the tag is added.
-
 - **Owner** (`Settings.OWNER_ATTRIBUTE`): the player who already sees this
-  part in the right place on their own screen, e.g. a player's own
-  hitboxes, so it doesn't need to be rewound for *their* queries. Set it
-  to that player's `Name`. Everyone else still gets the normal
-  lag-compensated treatment against it.
-- **Collision group**: must already be registered with
-  `Central.AddCollisionGroup(name)`, otherwise the part is silently reset
-  to `Settings.DEFAULT_HITBOX_COLLISIONGROUP`. Registering it is also what
-  makes it non-collidable with query groups, per the note above.
+  part in the right place on their own screen (e.g. their own character).
+  Set to that player's `Name`, their own queries check it live instead of
+  rewinding it. Everyone else still gets it lag-compensated.
+- Each recorded frame is just a `CFrame`/size/`CanCollide` snapshot, not a
+  simulated body, the history has no physics of its own. The live part
+  still behaves normally in `workspace` under Roblox's own physics.
 
-Each recorded frame is just a `CFrame`/size/`CanCollide` snapshot, not a
-simulated body, the history has no physics of its own. It's never pushed,
-never falls, and never collides with anything by itself; it only exists to
-be checked against when a query runs. The live part still behaves normally
-in `workspace` under Roblox's own physics, recording its history doesn't
-change that.
+### Debug hitbox visualization (server only)
 
-### Querying hitboxes
+No-ops unless `Settings.DEBUG_MODE` is `true`; when on, every query also
+draws its ray/shape and hit via the vendored Bolt visualizer.
 
 ```lua
--- server
-Central.AddQueryGroup("EnemyQuery") -- once, e.g. at bootstrap
-
-local raycastParams = RaycastParams.new()
-raycastParams.CollisionGroup = "EnemyQuery"
-
-local distance, instance, position, normal =
-    Central.Raycast(player, origin, direction, raycastParams)
+Central.ShowHitboxes(player, owner)         -- draw owner's hitboxes at player's rewound frame, i.e. what Central resolves player's queries against
+Central.HideHitboxes(player, owner)         -- stop that draw
+Central.ShowAllPlayerHitboxes(player)       -- like ShowHitboxes, for every other player + "Server"-owned hitboxes, recomputed live
+Central.RemoveAllPlayerHitboxes(player)     -- stop that draw
 ```
 
-`Central.Raycast`, `Shapecast`, `SimpleShapecast`, `GetBoundsInRadius`,
-`GetPartBoundsInBox`, and `GetPartsInPart` work like their `workspace`
-equivalents and take the same `RaycastParams`/`OverlapParams`:
+`owner` is a player's `Name`, or `"Server"` for hitboxes with no owner
+attribute. All four clean up automatically on `Players.PlayerRemoving`.
 
-- **On the client**, they're a plain pass-through to `workspace:Raycast`/
-  etc, no lag compensation happens there.
-- **On the server**, each call runs two queries and merges the results: a
-  normal **live** query against the world right now, and a **historical**
-  query against that player's rewound hitbox history. Raycasts/shapecasts
-  return whichever hit is closer; the overlap functions union both result
-  sets.
+## Getting synced client/server results under `BindToSimulation`
 
-Only these properties of `RaycastParams`/`OverlapParams` are honored:
-`CollisionGroup`, `RespectCanCollide`, `ExcludeInstances`,
-`IncludeInstances`, and, for the overlap functions only, `MaxParts`.
-
-If you set `CollisionGroup`, it must be registered with
-`Central.AddQueryGroup(name)`, or Central quietly falls back to
-`Settings.DEFAULT_HITBOX_QUERY_GROUP` instead. Registering it is what makes
-it non-collidable with hitbox groups, per the note above, that's the
-whole reason a custom query group needs to be registered.
-
-`querySettings` is an optional table (server only):
-`{ frameRange: number?, check: ((BasePart) -> boolean)? }`
-
-- `frameRange`: how many extra frames around the player's latency-resolved
-  frame to search. Defaults to `Settings.RAYCAST_FRAME_RANGE` for
-  `Raycast`, `Settings.COLLISION_FRAME_RANGE` for the rest.
-- `check`: a `(part: BasePart) -> boolean` filter for candidate hits. On
-  `Raycast`/`Shapecast`/`SimpleShapecast` it also makes the live cast
-  pierce through failing parts instead of stopping on them.
-
-See [Settings](#settings) for all tunable defaults (step frequency, frame
-history depth, tag/attribute names, etc).
-
-## Getting Synced Client/Server Results Under `BindToSimulation`
-
-For gameplay code like shooting or projectiles, bind the *same* function
-to `RunService:BindToSimulation` on both the client and the server, and
-call Central's query functions from inside it:
+For gameplay code like shooting, bind the *same* function to
+`RunService:BindToSimulation` on both the client and server, and call
+Central's query functions from inside it:
 
 ```lua
 RunService:BindToSimulation(function(delta)
-    if not isFiring() then
-        return
-    end
-
     local origin, direction = getAimRay()
     local distance, instance, position = Central.Raycast(player, origin, direction)
 
@@ -321,180 +155,99 @@ RunService:BindToSimulation(function(delta)
 end, Settings.StepFrequency, Settings.HitboxStepPriority + 100)
 ```
 
-`BindToSimulation` runs both sides off the same input for a given step,
-the client just sees it instantly, and the server sees it after a network
-delay. On the client, `Central.Raycast` is a plain live raycast. On the
-server, it's the live+historical merge: it rewinds to the frame matching
-the firing player's own latency, so it's checking against roughly the
-world the client was actually looking at. Same input, same rewound world
-state, so both sides usually land on the same hit, though not always,
-since jitter and latency variance keep it approximate.
+Both sides run off the same input for a step; the client sees it instantly,
+the server after a network delay. On the client, `Central.Raycast` is a
+plain live raycast. On the server it rewinds to the frame matching the
+firing player's own latency, so both sides usually land on the same hit
+(not always, jitter and latency variance keep it approximate).
 
 - Only apply real effects (damage, destroying a part) `if isServer`. The
-  client's call is just for local feedback, not proof of what the server
-  will decide.
-- `querySettings.frameRange` widens the tolerance if jitter is causing
-  disagreements.
-- A hitbox owned by the querying player (`Settings.OWNER_ATTRIBUTE`) is
-  checked live instead of historically, on both realms.
-- For something that moves every step, like a projectile you shapecast
-  each frame, give it a registered query collision group instead of a
-  hitbox one, so it doesn't physically collide with hitboxes and all its
-  hit detection goes through Central.
-- Your `BindToSimulation` binding must use a step priority **higher** than
+  client's call is just local feedback.
+- Widen `querySettings.frameRange` if jitter is causing disagreements.
+- A hitbox owned by the querying player is checked live instead of
+  historically, on both realms.
+- Something that moves every step (e.g. a projectile shapecast each frame)
+  should use a registered **query** group, not a hitbox group, so it
+  doesn't physically collide with hitboxes and all its hit detection goes
+  through Central.
+- Your binding's step priority must be **higher** than
   `Settings.HitboxStepPriority`. Central records that step's hitbox frame
-  and recomputes each player's rewound index in its own `BindToSimulation`
-  callback, at `Settings.HitboxStepPriority`; if your query-calling binding
-  runs first, it queries against last step's data instead of the current
-  one.
+  at that priority, so a lower/equal-priority binding queries last step's
+  data instead of the current one.
 
 ## How Character Latency Is Measured
 
-Central doesn't rely on raw network ping for `Settings.LATENCY_ATTRIBUTE`.
-Instead it measures the delay directly, by making the client compare two
-copies of the same motion against each other.
+Instead of raw network ping, Central measures perceived replication delay
+directly. Two dummies, far away from the playing area (make sure to set `Settings.LATENCY_DUMMY_HIDE_OFFSET` to a value that ensures that, but not too far to be affected by floating point), spin around a circle. In the server, they share the exact same positions and velocities. However, in the client, one of them is set to `Enum.PredictionMode.On`, and the other `Enum.PredictionMode.Off`. Roblox has to know the part interpolation delay to use it on the prediction, so the time the unpredicted dummy is behind the predicted dummy, *is the part interpolation delay*.
 
-The server keeps a hidden rig — two humanoid dummies on a platform, parked
-far out of the playable area at `Settings.LATENCY_DUMMY_HIDE_OFFSET`. Both
-dummies walk a continuous circle of radius `Settings.LATENCY_ORBIT_RADIUS`
-around a shared centre point. The orbit is deterministic and runs on the
-server and on every client alike, so each client is simulating the same
-motion the server is.
-
-The two dummies differ in exactly one way. On the client, one has
-`RunService:SetPredictionMode` set to `On` and the other to `Off`. The
-predicted dummy is reconciled against the client's own local simulation, so
-it tracks where the client *believes* the world is right now. The delayed
-dummy shows raw replicated state, so it tracks where the server's last
-received update actually put it. Circular motion turns the gap between them
-into an angle.
-
-Each measurement cycle, the client records the predicted dummy's current
-angle, then waits for the delayed dummy to sweep around to that same angle —
-either landing inside `Settings.LATENCY_ANGLE_EPSILON` of it, or crossing
-past it between two frames. The time that takes is how far behind the
-player's replicated view is running. That captures real perceived
-replication delay, including Roblox's own part-interpolation buffering,
-rather than round-trip ping. A cycle that never converges is abandoned after
-`Settings.LATENCY_MEASURE_TIMEOUT`, and there's a
-`Settings.LATENCY_MEASURE_PAUSE` gap between cycles.
-
-The client reports each result over a `RemoteEvent`. The server discards
-non-numbers and `NaN`, adds `Settings.LATENCY_OFFSET`, clamps the result
+Each cycle, the client records the predicted dummy's current angle, waits
+for the unpredicted dummy to sweep to that same angle, and reports the time
+that took over a `RemoteEvent`, that's how far behind the player's
+replicated view is running, including Roblox's own interpolation buffering.
+The server discards invalid samples, adds `Settings.LATENCY_OFFSET` (change this value if you feel the measures are a bit off, by default its 0), clamps
 into `[0, Settings.MAX_LATENCY]`, and averages the last
-`Settings.LATENCY_SAMPLE_WINDOW` samples. That mean is what gets written to
-the player's `Settings.LATENCY_ATTRIBUTE`, and it's the number Central
-rewinds hitbox history by. Because the offset is applied before the clamp,
-no amount of it can push the stored latency outside the history buffer's
-reach.
+`Settings.LATENCY_SAMPLE_WINDOW` samples into `Settings.LATENCY_ATTRIBUTE`,
+the number hitbox history gets rewound by.
 
-Worth knowing: **the measurement is client-reported.** The server
-sanity-checks and clamps it, but does not independently verify it, so a
-modified client can influence how far back its own shots are rewound —
-bounded by `MAX_LATENCY`. If that matters for your game, treat
-`MAX_LATENCY` as the security-relevant knob.
+**The measurement is client-reported.** The server clamps and sanity-checks
+it but doesn't independently verify it, so a modified client can influence
+how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
+`MAX_LATENCY` as the security-relevant knob if that matters for your game.
 
 ## Performance
 
-Measured on the server in Studio against a synthetic rig: a cubic grid of
-3×3×3 anchored hitbox parts spaced 7 studs apart, every one of them moved
-each frame, with all 60 history frames populated at distinct poses. Queries
-are timed against `HistoricalHitboxes` directly, so these are the
-lag-compensation costs alone — `Central.Raycast` and friends add a live
-`workspace:Raycast`/`Shapecast` on top, whose cost depends on your map.
-Settings were the defaults (`RAYCAST_FRAME_RANGE`/`COLLISION_FRAME_RANGE`
-of `1`, `PREFER_NEAREST_FRAME = true`, `FRAME_CAP = 60`).
+Measured server-side in Studio: a 3×3×3 grid of anchored hitbox parts
+(7 studs apart), all moved and all 60 history frames populated every frame,
+at default settings (`FRAME_CAP = 60`, frame ranges of `1`,
+`PREFER_NEAREST_FRAME = true`). Timed against `HistoricalHitboxes` directly,
+lag-compensation cost alone; `Central.Raycast`/friends add a live
+`workspace` cast on top. Absolute numbers will move with hardware; the
+scaling behavior is the part worth trusting.
 
-Absolute numbers will move with hardware; the scaling behaviour is the part
-worth reading.
+**Closest-hit queries are flat in hitbox count**: 16× the hitboxes costs
+the same, because the tree prunes to the closest hit during traversal:
 
-### Cost of queries
+| hitboxes | `Raycast` | `Shapecast` | `SimpleShapecast` | Overlap (per part) |
+|---|---|---|---|---|
+| 50 | 0.94 µs | 1.35 µs | 1.23 µs | 50.3 µs (1.05 µs) |
+| 400 | 1.01 µs | 1.51 µs | 1.40 µs | 70.8 µs (1.11 µs) |
+| 800 | 1.03 µs | 1.42 µs | 1.37 µs | 70.1 µs (1.10 µs) |
 
-Direct hits, in microseconds:
-
-| hitboxes | `Raycast` | `Shapecast` | `SimpleShapecast` | overlap | parts the overlap returned |
-|---|---|---|---|---|---|
-| 50 | 0.94 | 1.35 | 1.23 | 50.28 | 48 |
-| 100 | 0.99 | 1.46 | 1.40 | 34.23 | 27 |
-| 200 | 1.20 | 2.02 | 1.77 | 66.68 | 64 |
-| 400 | 1.01 | 1.51 | 1.40 | 70.75 | 64 |
-| 800 | 1.03 | 1.42 | 1.37 | 70.14 | 64 |
-
-The three closest-hit queries are effectively flat in hitbox count — 16×
-the hitboxes costs the same — because the tree prunes to the closest hit
-during traversal and the frame scan stops at the first frame that produces
-one. What they actually cost depends on two other things instead.
-
-**Whether the cast connects.** At 400 hitboxes:
+What actually moves the cost: **whether the cast connects** (400 hitboxes).
+A clean hit bounds the search so everything farther is skipped; a grazing
+shapecast never establishes that bound, so every candidate gets tested
+(~10× a direct hit):
 
 | | `Raycast` | `Shapecast` | `SimpleShapecast` |
 |---|---|---|---|
-| direct hit | 0.97 | 1.54 | 1.39 |
-| grazing contact | 1.28 | 14.65 | 14.20 |
-| empty space | 0.76 | 1.02 | 0.92 |
+| direct hit | 0.97 µs | 1.54 µs | 1.39 µs |
+| grazing contact | 1.28 µs | 14.65 µs | 14.20 µs |
+| empty space | 0.76 µs | 1.02 µs | 0.92 µs |
 
-A shapecast that barely clips a hitbox costs roughly 10× one that hits it
-squarely. A clean hit immediately bounds the search, so everything further
-away is skipped without an exact test — one narrow-phase call instead of
-sixteen, measured. A grazing contact never establishes that bound, so every
-candidate gets tested. Empty space is cheapest, since the broad phase
-rejects everything up front. Rays are barely affected either way, being
-infinitely thin.
+And for overlap queries, **which shape you query with**: a hitbox is
+always a box, so the test is box × your shape; box/sphere/capsule get a
+dedicated routine 1.5–5× faster than the GJK fallback everything else uses:
 
-**Which shape you query with**, for the overlap functions. A hitbox is
-always stored as a box, so an overlap test is box × your query shape. Box,
-sphere and capsule have dedicated routines; everything else falls back to
-the general GJK solver. Per call, on an identical pair (µs):
+| query shape | routine | per-call (overlapping/separated) |
+|---|---|---|
+| box | `box_box` | 0.14 / 0.07 µs |
+| sphere | `box_sphere` | 0.13 / 0.13 µs |
+| capsule | `box_capsule` | 0.24 / 0.19 µs |
+| cylinder, wedge, corner wedge, ellipsoid | GJK fallback | 0.5–0.8 µs |
 
-| query shape | overlapping | separated | routine |
-|---|---|---|---|
-| box | 0.137 | 0.071 | `box_box` |
-| sphere | 0.131 | 0.128 | `box_sphere` |
-| capsule | 0.242 | 0.194 | `box_capsule` |
-| cylinder | 0.532 | 0.325 | GJK fallback |
-| corner wedge | 0.730 | 0.349 | GJK fallback |
-| wedge | 0.737 | 0.339 | GJK fallback |
-| ellipsoid | 0.766 | 0.357 | GJK fallback |
+`GetPartBoundsInBox`/`GetBoundsInRadius` always stay on a dedicated routine;
+`GetPartsInPart` derives the shape from the part you hand it, so a
+Cylinder/Wedge/mesh part drops to GJK, approximate with the other two on a
+hot path if the exact silhouette doesn't matter. Overlap cost overall tracks
+how many hitboxes fall *inside* the query volume, not how many exist.
 
-**The dedicated routines are 1.5–5× faster and return the same answer, so
-prefer the simplest shape that describes your query.** The difference is
-amplified in a real overlap call, because overlap queries must report every
-result and so can never prune — a slower test is paid in full, once per
-candidate per frame scanned. Over 400 hitboxes:
+**Per frame**: median of 600 timed frames, each covering `UpdateFrame` plus
+the stated number of queries, measured in place (so it includes the cache
+pressure a query pays right after `UpdateFrame` just walked the whole tree;
+a query timed alone in a tight loop looks 1.5–2× cheaper than this).
 
-| query shape | cost | parts returned | per part |
-|---|---|---|---|
-| box | 64.6 µs | 64 | 1.01 µs |
-| sphere | 60.0 µs | 32 | 1.87 µs |
-| cylinder | 161.7 µs | 48 | 3.37 µs |
-
-The cylinder costs about 2.5× the box query while returning fewer parts.
-Which branch you land on follows from the function you call:
-`GetPartBoundsInBox` always builds a box and `GetBoundsInRadius` always
-builds a sphere, so both stay on a dedicated routine. `GetPartsInPart`
-derives the shape from the part you hand it — a Block or Ball is fine, but
-a Cylinder, Wedge, CornerWedge or mesh part drops to GJK. If that's on a
-hot path, approximating it with `GetPartBoundsInBox` or `GetBoundsInRadius`
-is worth roughly 2.5× whenever the exact silhouette doesn't matter.
-
-Shape choice only affects the overlap functions;
-`Shapecast`/`SimpleShapecast` go through the GJK shapecast solver
-regardless.
-
-Overlap cost also tracks the last column of the first table rather than the
-first: what matters is how many hitboxes fall inside the query volume, not
-how many exist.
-
-### Cost per frame
-
-The numbers below are the median of 600 timed frames, each one covering
-`UpdateFrame` plus the stated number of queries. They are measured in
-place, so they include the cache pressure a query really pays after
-`UpdateFrame` has just walked the whole tree — a query timed alone in a
-tight loop looks 1.5–2× cheaper than it is in a frame.
-
-`UpdateFrame` runs once per simulation step whether or not you query, and
-is roughly linear in hitbox count (the `0 casts` column below):
+`UpdateFrame` runs once per simulation step regardless of querying, and is
+roughly linear in hitbox count:
 
 | hitboxes | per frame | per hitbox |
 |---|---|---|
@@ -514,9 +267,8 @@ Whole frame with raycasts, as a share of one 60 Hz frame (16667 µs):
 | 400 | 4.7% | 5.0% | 5.1% | 5.0% | 5.2% | 5.5% | 6.1% |
 | 800 | 10.4% | 10.8% | 11.6% | 11.0% | 11.7% | 11.7% | 13.2% |
 
-And with shapecasts, which land within noise of the raycast figures at
-every count — the per-cast difference is small enough that `UpdateFrame`
-dominates either way:
+Shapecasts land within noise of those raycast figures at every count; the
+per-cast difference is small enough that `UpdateFrame` dominates either way:
 
 | hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
 |---|---|---|---|---|---|---|---|
@@ -526,62 +278,56 @@ dominates either way:
 | 400 | 4.7% | 4.9% | 4.9% | 5.1% | 5.1% | 5.4% | 6.0% |
 | 800 | 11.1% | 11.1% | 11.2% | 11.7% | 11.1% | 11.9% | 12.8% |
 
-Casts are cheap next to the per-frame bookkeeping: at 400 hitboxes, going
-from zero to 100 casts per frame adds about 1.3% of the budget, while the
-hitbox count alone already costs 4.7%. If you need to cut Central's cost,
-reduce how many parts carry `Settings.HITBOX_TAG` — adding query volume is
-comparatively cheap.
-
-One caveat on the medians: a tree occasionally rebuilds
-(`TREE_REBUILD_CHECK_INTERVAL`), which makes that frame markedly more
-expensive. Those spikes are real but rare and staggered across trees, so
-they sit in the tail rather than the median.
+If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG`,
+adding query volume is comparatively cheap. (One caveat on the medians: a
+historical tree occasionally rebuilds (`TREE_REBUILD_CHECK_INTERVAL`) and
+that frame spikes; rare and staggered across trees, so it shows up in the
+tail, not the median.)
 
 ## Settings
 
-Every tunable lives as a plain field on the table at `lib/Settings.luau`
+Every tunable lives on the table at `lib/Settings.luau`
 (`Central.Settings`/`CentralServer.Settings` are the same table). Several
-fields get captured into local variables the moment the package is first
-required, so mutating `Central.Settings` at runtime doesn't reliably take
-effect for all of them — editing `lib/Settings.luau` directly is the safest
-way to change a default.
+fields are captured into locals the moment the package is first required,
+so editing `lib/Settings.luau` directly, not mutating `Central.Settings` at
+runtime, is the safe way to change a default.
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `DEBUG_MODE` | `false` | Draws rays/hit boxes for every query via the vendored Bolt visualizer, and gates `Central.ShowHitboxes`/`HideHitboxes`/`ShowAllPlayerHitboxes`/`RemoveAllPlayerHitboxes` — see [Debug Hitbox Visualization](#debug-hitbox-visualization-server-only). Costs performance — leave off outside debugging. |
-| `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. Only matters if `DEBUG_MODE` is on. |
-| `StepFrequency` | `Enum.StepFrequency.Hz60` | How often Central's own `BindToSimulation` loop records a hitbox frame and recomputes each player's rewound index — see [Getting Synced Client/Server Results](#getting-synced-clientserver-results-under-bindtosimulation). |
-| `HitboxStepPriority` | `1000` | The priority Central's internal `BindToSimulation` binding runs at. Your own query-calling bindings need a higher priority number than this. |
+| `DEBUG_MODE` | `false` | Draws rays/hitboxes for every query, and gates the `Show`/`Hide`Hitboxes functions. Costs performance, leave off outside debugging. |
+| `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. |
+| `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop records a hitbox frame and recomputes rewound indices. |
+| `HitboxStepPriority` | `1000` | Priority Central's internal binding runs at; your own query-calling bindings need a higher number. |
 | `AUTO_ADD_CHARACTERS` | `true` | Auto-tags every part of a spawning player's character as an owned hitbox. |
-| `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | The query collision group Central falls back to when a query's `CollisionGroup` isn't a registered query group. |
-| `INITIAL_QUERY_GROUPS` | `{DEFAULT_HITBOX_QUERY_GROUP}` | Query groups registered automatically by `Central.Start()`, equivalent to calling `Central.AddQueryGroup` for each. |
-| `DEFAULT_HITBOX_COLLISIONGROUP` | `"HitboxCollison"` | The collision group a tagged hitbox part is forced onto if its `CollisionGroup` isn't a registered hitbox group. |
-| `INITIAL_COLLISION_GROUPS` | `{DEFAULT_HITBOX_COLLISIONGROUP}` | Hitbox groups registered automatically by `Central.Start()`, equivalent to calling `Central.AddCollisionGroup` for each. |
-| `HITBOX_TAG` | `"CompensatedHitbox"` | The `CollectionService` tag that marks a `BasePart` as lag-compensated — see [Creating a hitbox](#creating-a-hitbox). |
-| `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name` — see [Creating a hitbox](#creating-a-hitbox). |
-| `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged measured latency to — see [How Character Latency Is Measured](#how-character-latency-is-measured). |
-| `FRAME_CAP` | `60` | Size of the hitbox/time history ring buffer. Combined with `StepFrequency`, this bounds how far back Central can rewind (60 frames at 60 Hz ≈ 1 second by default). |
-| `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Central.Raycast`. |
-| `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/the overlap functions. |
-| `PREFER_NEAREST_FRAME` | `true` | How a closest-hit query picks a winner when several frames in `frameRange` produce a hit. `true`: a hit in a frame nearer the player's rewound index wins outright, regardless of distance. `false`: the spatially closest hit across the whole range wins, ties going to the nearer frame. |
-| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. The check scans every node, so running it on each frame update is wasteful while the trees stay balanced. |
-| `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomise each tree's next check, on top of an even initial stagger, so the trees never come due on the same frame. |
-| `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before it's clamped and averaged. Use it to bias compensation earlier or later if it consistently runs ahead of or behind what players see; the clamp keeps the result inside `[0, MAX_LATENCY]` either way. |
-| `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. Higher is steadier but slower to react to a change in a player's connection. |
-| `MAX_LATENCY` | `1` | Upper clamp (seconds) on a client-reported latency sample. Matches the history buffer's span (`FRAME_CAP` / `StepFrequency`), and bounds how far a modified client could push its own rewind. |
-| `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the measurement rig is parked, out of the playable map. |
+| `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | Fallback query group for an unregistered `CollisionGroup`. |
+| `INITIAL_QUERY_GROUPS` | `{DEFAULT_HITBOX_QUERY_GROUP}` | Query groups auto-registered by `Central.Start()`. |
+| `DEFAULT_HITBOX_COLLISIONGROUP` | `"HitboxCollison"` | Fallback hitbox group for an unregistered `CollisionGroup`. |
+| `INITIAL_COLLISION_GROUPS` | `{DEFAULT_HITBOX_COLLISIONGROUP}` | Hitbox groups auto-registered by `Central.Start()`. |
+| `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
+| `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
+| `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
+| `FRAME_CAP` | `60` | Size of the history ring buffer; bounds how far back Central can rewind (60 @ 60 Hz ≈ 1s). |
+| `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Raycast`. |
+| `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
+| `PREFER_NEAREST_FRAME` | `true` | Tie-break when several frames in range produce a hit: `true` = nearest frame wins regardless of distance; `false` = spatially closest wins, ties to nearer frame. |
+| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. |
+| `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
+| `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before clamp/average; bias compensation earlier/later. |
+| `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. |
+| `MAX_LATENCY` | `1` | Upper clamp (s) on a reported latency sample; also bounds how far a modified client can push its own rewind. |
+| `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the latency measurement rig is parked, off-map. |
 | `LATENCY_ORBIT_RADIUS` | `25` | Radius (studs) of the circle the two latency dummies walk. |
-| `LATENCY_ANGLE_EPSILON` | `math.rad(0.1)` | How close the delayed dummy's angle must get to the predicted dummy's recorded angle to count as having caught up. |
+| `LATENCY_ANGLE_EPSILON` | `math.rad(0.1)` | How close the delayed dummy must get to the predicted dummy's recorded angle to count as caught up. |
 | `LATENCY_MEASURE_TIMEOUT` | `1` | Seconds before an unconverged measurement cycle is abandoned. |
-| `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds to wait between measurement cycles. |
-| `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a hitbox flush against world geometry still registers. |
+| `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds between measurement cycles. |
+| `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a flush hitbox still registers. |
 | `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
-| `AABB_PADDING` | `1` | Padding (in studs) added around each hitbox's bounding box in the per-frame AABB tree, giving queries slack before the tree needs a partial rebuild as parts move. |
+| `AABB_PADDING` | `1` | Padding (studs) around each hitbox's bounding box in the AABB tree, giving queries slack before a partial rebuild is needed. |
 
 ## Third-party code
 
 `lib/bolt` and `lib/visualizer.luau` from
-[unityjaeger/Bolt](https://github.com/unityjaeger/Bolt) 
+[unityjaeger/Bolt](https://github.com/unityjaeger/Bolt)
 
 [Observers](https://sleitnick.github.io/RbxObservers/api/Observers/)
 (`sleitnick/observers`), pulled in as a regular Wally dependency
