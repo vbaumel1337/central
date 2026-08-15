@@ -204,13 +204,31 @@ function Central.RemoveAllPlayerHitboxes(player: Player)
     hitboxViewsAll[player] = nil
 end
 
-local function filterByInclude(owned: {BasePart}, include: {Instance}?): {Instance}
-    if not include or #include == 0 then
-        return (owned :: any) :: {Instance}
+local function isExcluded(part: BasePart, exclude: {Instance}?): boolean
+    if not exclude then
+        return false
     end
+    for _, excluded in exclude do
+        if part == excluded or part:IsDescendantOf(excluded) then
+            return true
+        end
+    end
+    return false
+end
 
+-- Roblox does not reliably prioritize ExcludeInstances over IncludeInstances when the
+-- included part is a descendant of the excluded instance, so exclusions must be applied
+-- here before the owned parts are ever placed in IncludeInstances.
+local function filterByInclude(owned: {BasePart}, include: {Instance}?, exclude: {Instance}?): {Instance}
     local filtered: {Instance} = {}
     for _, part in owned do
+        if isExcluded(part, exclude) then
+            continue
+        end
+        if not include or #include == 0 then
+            table.insert(filtered, part)
+            continue
+        end
         for _, included in include do
             if part == included or part:IsDescendantOf(included) then
                 table.insert(filtered, part)
@@ -334,7 +352,11 @@ local function liveHitboxAwareRaycast(player: Player, origin: Vector3, direction
                 ownedParams.RespectCanCollide = params.RespectCanCollide
             end
         end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil)
+        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
+
+        if #ownedParams.IncludeInstances == 0 then
+            return result, resultDistance
+        end
 
         if check then
             local ownedResult, ownedDistance = raycastExcludeRetry(origin, direction, ownedParams, check)
@@ -393,9 +415,11 @@ local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) 
                 ownedParams.MaxParts = params.MaxParts
             end
         end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil)
-        local ownedResult = queryFn(ownedParams)
-        mergeArrayUnique(result, ownedResult)
+        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
+        if #ownedParams.IncludeInstances > 0 then
+            local ownedResult = queryFn(ownedParams)
+            mergeArrayUnique(result, ownedResult)
+        end
     end
 
     if check then
@@ -449,17 +473,19 @@ local function liveHitboxAwareShapecast(player: Player, part: Part, direction: V
                 ownedParams.RespectCanCollide = params.RespectCanCollide
             end
         end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil)
+        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
 
-        local ownedResult: RaycastResult?
-        if check then
-            ownedResult = shapecastExcludeRetry(part, direction, ownedParams, check)
-        else
-            ownedResult = workspace:Shapecast(part, direction, ownedParams)
-        end
+        if #ownedParams.IncludeInstances > 0 then
+            local ownedResult: RaycastResult?
+            if check then
+                ownedResult = shapecastExcludeRetry(part, direction, ownedParams, check)
+            else
+                ownedResult = workspace:Shapecast(part, direction, ownedParams)
+            end
 
-        if ownedResult and (not result or ownedResult.Distance < result.Distance) then
-            result = ownedResult
+            if ownedResult and (not result or ownedResult.Distance < result.Distance) then
+                result = ownedResult
+            end
         end
     end
 
@@ -492,7 +518,7 @@ function Central.Raycast(player:Player, origin:Vector3, direction:Vector3, rayca
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN)  else direction
 
         local hitbox, hitPoint, hitDistance, hitNormal = CentralServer.QueryPlayerRaycast(player, origin, newDirection, querySettings and querySettings.frameRange, raycastParams, check)
-        if hitbox and (not check or not distance or (hitDistance :: number) < distance) then
+        if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
             instance = hitbox.instance
             position = hitPoint
@@ -533,7 +559,7 @@ function Central.Shapecast(player:Player, part:Part, direction:Vector3, raycastP
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
         local hitbox, hitPoint, hitDistance, hitNormal = CentralServer.QueryPlayerShapecast(player, part.CFrame, bolt.create_from_part(part), newDirection, querySettings and querySettings.frameRange, raycastParams, check)
-        if hitbox and (not check or not distance or (hitDistance :: number) < distance) then
+        if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
             instance = hitbox.instance
             position = hitPoint
@@ -573,7 +599,7 @@ function Central.SimpleShapecast(player:Player, part:Part, direction:Vector3, ra
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
         local hitbox, hitDistance = CentralServer.QueryPlayerSimpleShapecast(player, part.CFrame, bolt.create_from_part(part), newDirection, querySettings and querySettings.frameRange, raycastParams, check)
-        if hitbox and (not check or not distance or (hitDistance :: number) < distance) then
+        if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
             instance = hitbox.instance
         end
