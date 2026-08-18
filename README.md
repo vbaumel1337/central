@@ -51,14 +51,25 @@ Central.Start()
 
 ### Queries
 
-Every query takes the `player` it's being cast on behalf of (used to
-lag-compensate against, and to resolve that player's own hitboxes live) and
-an optional `querySettings`. On the client these are a plain pass-through to
-their Roblox counterpart, no compensation happens. On the server, each call
-runs a normal **live** query against the world right now plus a
-**historical** query against that player's rewound hitbox history, and
-merges them: the cast functions return whichever hit is closer, the overlap
-functions union both result sets.
+Every query takes the `player` it's being cast on behalf of and an optional
+`querySettings`. On the client these are a plain pass-through to their Roblox
+counterpart, no compensation happens.
+
+On the server each call resolves in three parts and merges them, with the cast
+functions returning whichever hit is closest and the overlap functions unioning
+the result sets:
+
+1. **The world**, queried live through `workspace` with every compensated
+   hitbox filtered out by collision group.
+2. **The querying player's own hitboxes**, at the newest history sample. A
+   player sees their own character where the server has it, so these are never
+   rewound. `Settings.OWNED_HITBOX_SOURCE = "live"` resolves them with a second
+   `workspace` query against true engine geometry instead.
+3. **Everyone else's hitboxes**, rewound to what this player actually saw, and
+   blended between the two history samples their latency falls between.
+
+Each pass bounds the next: a hit from the world shortens the cast the owned
+pass searches, and a hit from either shortens the compensated pass.
 
 ```lua
 Central.Raycast(player, origin, direction, raycastParams?, querySettings?)          -- workspace:Raycast               -> distance, instance, position, normal
@@ -169,7 +180,10 @@ firing player's own latency, so both sides usually land on the same hit
 
 - Only apply real effects (damage, destroying a part) `if isServer`. The
   client's call is just local feedback.
-- Widen `querySettings.frameRange` if jitter is causing disagreements.
+- `querySettings.frameRange` defaults to `0`, because a rewind is blended to
+  the exact time between two samples rather than snapped to the nearest one.
+  Widen it only for hitboxes that move far enough within one capture interval
+  to escape the bounds of both samples either side.
 - A hitbox owned by the querying player is never rewound: it resolves at the
   newest history sample rather than at that player's latency. Set
   `Settings.OWNED_HITBOX_SOURCE = "live"` to resolve it with a second
@@ -179,9 +193,9 @@ firing player's own latency, so both sides usually land on the same hit
   doesn't physically collide with hitboxes and all its hit detection goes
   through Central.
 - Your binding's step priority must be **higher** than
-  `Settings.HitboxStepPriority`. Central records that step's hitbox frame
-  at that priority, so a lower/equal-priority binding queries last step's
-  data instead of the current one.
+  `Settings.HitboxStepPriority`. Central captures history at that priority, so
+  on the steps where a capture happens a lower or equal priority binding
+  resolves against the previous sample instead of the one just taken.
 
 ## How Character Latency Is Measured
 
@@ -202,22 +216,99 @@ it but doesn't independently verify it, so a modified client can influence
 how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
 `MAX_LATENCY` as the security-relevant knob if that matters for your game.
 
+## History storage
+
+History is sampled on its own cadence, not once per simulation step. Roblox
+replicates player characters at roughly 20 Hz, so capturing at 60 stored two
+duplicates for every real sample. `Settings.HISTORY_CAPTURE_DIVISOR` (default
+`3`) captures one sample every N steps, and `FRAME_CAP` (default `20`) is how
+many samples are kept. The window they span is
+`FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency`, and it has to reach
+`MAX_LATENCY` — at the defaults that is exactly one second.
+
+A longer interval only works because a rewind no longer snaps to a sample. The
+player's latency resolves to the two samples it falls between plus how far
+along it is, and the hitbox is evaluated at that blended pose. The sample
+decides which hitboxes are candidates; the rewind time decides where they were.
+That is strictly more accurate than picking a nearest frame, and it is what
+`RAYCAST_FRAME_RANGE` / `COLLISION_FRAME_RANGE` existed to compensate for, so
+both now default to `0`.
+
+The one thing it costs: the broad phase still bounds each sample's own pose
+rather than the swept interval between samples, so a hitbox that moves far
+enough within one capture interval can be missed at the blended pose in
+between. Widen `frameRange`, or drop `HISTORY_CAPTURE_DIVISOR` to `1`, if you
+have hitboxes like that.
+
+### Backends
+
+`Settings.HISTORY_BACKEND` picks how the samples are stored. Both expose
+identical query semantics and results; they differ only in what they keep per
+sample.
+
+**`"trees"`** (default, shipping) keeps one bolt dynamic tree per sample. Each
+capture rewrites one of them with the current pose of every hitbox.
+
+**`"refit"`** (prototype) separates the two things a BVH holds. Topology — which
+leaves are siblings — is expensive and changes slowly, so one tree owns it and
+is mutated only when a part is added or removed, plus an occasional rebuild for
+quality. Bounds are cheap and change every capture, so each sample stores
+nothing but a pair of `{vector}` arrays indexed by that tree's node indices. A
+capture writes each part's exact AABB into its leaf slot and runs one bottom-up
+pass to fill the internal nodes: linear, no restructuring, no allocation.
+Queries point the tree's bounds arrays at the sample being queried, so the
+broad phase is bolt's own traversal, unmodified.
+
+Only the grouping is shared across samples. The boxes a query tests are still
+each sample's exact per-part AABBs, so they are as tight as the per-sample
+trees'. What a shared topology costs is grouping quality: two parts that are
+siblings because they were near each other across the window may not be near
+each other in the one sample being queried. `"refit"` also ignores
+`AABB_PADDING`, since it stores exact bounds and never re-tests containment.
+
 ## Performance
 
-> **Stale.** These numbers were measured before history capture was decoupled
-> from the simulation step, before the per-candidate query filter was hoisted,
-> and before owned hitboxes moved onto the history path. They describe the
-> shipping backend at the old defaults (`FRAME_CAP = 60`, capture every step,
-> frame ranges of `1`). The scaling behaviour still holds; the absolute figures
-> do not. Re-measure before quoting them.
+> **None of this branch has been run in Roblox.** It compiles, and the two new
+> algorithms (bounds refit and rewind bracketing) pass standalone tests, but
+> nothing here has been executed in a live game or timed. Treat it as untested.
 
-Measured server-side in Studio: a 3×3×3 grid of anchored hitbox parts
-(7 studs apart), all moved and all 60 history frames populated every frame,
-at default settings (`FRAME_CAP = 60`, frame ranges of `1`,
-`PREFER_NEAREST_FRAME = true`). Timed against `HistoricalHitboxes` directly,
-lag-compensation cost alone; `Central.Raycast`/friends add a live
-`workspace` cast on top. Absolute numbers will move with hardware; the
-scaling behavior is the part worth trusting.
+The figures in this section are a **baseline taken before this branch**. They
+are kept because the scaling behaviour they show still holds and it is what the
+changes were aimed at, but the absolute numbers no longer describe the code:
+since they were measured, history capture was decoupled from the simulation
+step, the per-candidate query filter was hoisted out of the narrow phase, owned
+hitboxes moved onto the history path, and the per-part shadow ring was deleted.
+
+### What to measure
+
+`UpdateFrame` dominated the old profile. At 800 hitboxes it was 10.4% of a
+60 Hz frame with zero casts, and 100 raycasts on top only took that to 13.2%,
+so roughly nine tenths of the cost was maintaining history rather than querying
+it. Everything on this branch aims there. The measurements worth taking:
+
+| Measurement | What it tells you |
+|---|---|
+| `UpdateFrame` per capture, at 50 / 100 / 200 / 400 / 800 hitboxes | The headline. Compare per-hitbox cost, not just totals. |
+| That same per-hitbox cost as count grows | The old profile climbed 1.38 → 2.16 µs because the tree insert is `O(log N)` with a widening search. Under `"refit"` it should stay flat. If it climbs, the shared-topology approach is not paying off. |
+| `UpdateFrame` frequency against wall time | It now runs once every `HISTORY_CAPTURE_DIVISOR` steps, so amortised per-frame cost should fall by that factor on top of any per-capture win. |
+| Closest-hit query cost, `"trees"` vs `"refit"` | Where a shared topology gets paid for. Queries were ~1 µs and flat in hitbox count; that flatness is the thing to protect. |
+| Query cost with `ExcludeInstances` set, and with `check` set | Where the filter hoist lands. The old path ran a `CollisionGroupsAreCollidable` call plus an `IsDescendantOf` walk per candidate per sample. |
+| Owned-hitbox queries, `OWNED_HITBOX_SOURCE` `"history"` vs `"live"` | The `"live"` path allocates params, marshals an include list, and with `check` set runs an iterative exclude-and-retry loop. |
+| Peak memory / hitbox | `FRAME_CAP` dropped 60 → 20, the shadow ring is gone, and `"refit"` replaces 59 trees with bound arrays. |
+
+Flip `HISTORY_BACKEND` and `HISTORY_CAPTURE_DIVISOR` to A/B in place; both are
+plain settings and neither changes query semantics.
+
+### Baseline
+
+Measured server-side in Studio on the `"trees"` backend at the settings that
+were default at the time: `FRAME_CAP = 60`, a capture every simulation step
+(all 60 history frames populated every frame), frame ranges of `1`,
+`PREFER_NEAREST_FRAME = true`. The workload was a 3×3×3 grid of anchored hitbox
+parts, 7 studs apart, all moved every frame. Timed against `HistoricalHitboxes`
+directly, lag-compensation cost alone; `Central.Raycast`/friends add a live
+`workspace` cast on top. Absolute numbers will move with hardware; the scaling
+behavior is the part worth trusting.
 
 **Closest-hit queries are flat in hitbox count**: 16× the hitboxes costs
 the same, because the tree prunes to the closest hit during traversal:
@@ -297,7 +388,9 @@ If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG`,
 adding query volume is comparatively cheap. (One caveat on the medians: a
 historical tree occasionally rebuilds (`TREE_REBUILD_CHECK_INTERVAL`) and
 that frame spikes; rare and staggered across trees, so it shows up in the
-tail, not the median.)
+tail, not the median. Under `"refit"` there is one tree rather than 60, so the
+spike is single but unstaggered, and it also dirties every sample's internal
+node bounds — `HISTORY_REFIT_BUDGET` spreads that repair over later captures.)
 
 ## Settings
 
@@ -328,9 +421,9 @@ runtime, is the safe way to change a default.
 | `HISTORY_REFIT_BUDGET` | `4` | `refit` backend only. How many stale samples each capture re-refits, spreading the cost of a topology change. |
 | `RAYCAST_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Raycast`. |
 | `COLLISION_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
-| `PREFER_NEAREST_FRAME` | `true` | Tie-break when several frames in range produce a hit: `true` = nearest frame wins regardless of distance; `false` = spatially closest wins, ties to nearer frame. |
-| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. |
-| `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
+| `PREFER_NEAREST_FRAME` | `true` | Tie-break when `frameRange` widens the search and several samples produce a hit: `true` = the sample nearer the rewind wins regardless of distance; `false` = spatially closest wins, ties to the nearer sample. No effect at the default `frameRange` of `0`. |
+| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on a historical AABB tree. Under `"trees"` that is per sample tree; under `"refit"` there is only one tree, and the check also refreshes the bounds it is rebuilt from. |
+| `TREE_REBUILD_CHECK_JITTER` | `0.2` | `"trees"` backend only. Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
 | `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before clamp/average; bias compensation earlier/later. |
 | `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. |
 | `MAX_LATENCY` | `1` | Upper clamp (s) on a reported latency sample; also bounds how far a modified client can push its own rewind. |
