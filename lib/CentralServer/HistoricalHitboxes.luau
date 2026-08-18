@@ -1,11 +1,11 @@
 --!native
 --!strict
 --!optimize 2
-local PhysicsService = game:GetService("PhysicsService")
 
 local bolt = require(script.Parent.Parent.bolt)
 local Settings = require(script.Parent.Parent.Settings)
 local PartRegister = require(script.Parent.Registers.PartRegister)
+local QueryFilter = require(script.Parent.QueryFilter)
 
 local gjk = bolt.dispatch.gjk
 local collision = bolt.collision
@@ -67,46 +67,8 @@ export type HistoricalHitboxes = typeof(setmetatable(
 	HistoricalHitboxes
 ))
 
-local DEFAULT_GROUP = Settings.DEFAULT_HITBOX_QUERY_GROUP
-
 local function wrapIndex(index: number, frameCap: number): number
 	return ((index - 1) % frameCap) + 1
-end
-
-local function isFilteredOut(hitbox: Hitbox, params: (RaycastParams | OverlapParams)?): boolean
-
-	if not params then
-		return false
-	end
-
-	if params.RespectCanCollide and not hitbox.canCollide then
-		return true
-	end
-
-	if not PhysicsService:CollisionGroupsAreCollidable(params.CollisionGroup or DEFAULT_GROUP, hitbox.collisionGroup) then
-		return true
-	end
-
-	local exclude = params.ExcludeInstances :: {Instance}?
-	if exclude then
-		for _, excluded in ipairs(exclude) do
-			if hitbox.instance == excluded or hitbox.instance:IsDescendantOf(excluded) then
-				return true
-			end
-		end
-	end
-
-	local include = params.IncludeInstances :: {Instance}?
-	if include and #include > 0 then
-		for _, included in ipairs(include) do
-			if hitbox.instance == included or hitbox.instance:IsDescendantOf(included) then
-				return false
-			end
-		end
-		return true
-	end
-
-	return false
 end
 
 function HistoricalHitboxes.new(frameCap: number, padding: number): HistoricalHitboxes
@@ -233,6 +195,7 @@ end
 
 function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
 	local playerName = player.Name
+	local filter = QueryFilter.resolve(params)
 	local invLength = fractionScale(rayDirection)
 
 	local bestDistance = math.huge
@@ -249,7 +212,7 @@ function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Playe
 
 		self.trees[index]:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
+			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -301,6 +264,7 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 	end
 
 	local playerName = player.Name
+	local filter = QueryFilter.resolve(params)
 	local invLength = fractionScale(direction)
 
 	local bestDistance = math.huge
@@ -316,7 +280,7 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 
 		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
+			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -366,6 +330,7 @@ function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, playe
 	end
 
 	local playerName = player.Name
+	local filter = QueryFilter.resolve(params)
 	local invLength = fractionScale(direction)
 
 	local bestDistance = math.huge
@@ -379,7 +344,7 @@ function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, playe
 
 		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
+			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -435,6 +400,7 @@ end
 
 function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: Hitbox}
 	local playerName = player.Name
+	local filter = QueryFilter.resolve(params)
 	local results: {[BasePart]: Hitbox} = {}
 	local partCount = 0
 	local maxParts = (params and params.MaxParts) or math.huge
@@ -445,7 +411,7 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 		local frameHitboxes = self.hitboxes[index]
 		for _, id in self.trees[index]:query_shape(cframe, shape) do
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) or not collides(hitbox, cframe, shape) then
+			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) or not collides(hitbox, cframe, shape) then
 				continue
 			end
 
