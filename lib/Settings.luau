@@ -22,8 +22,9 @@ local Settings = {
     OWNER_ATTRIBUTE = "HitboxOwner",
     LATENCY_ATTRIBUTE = "PartLatency",
 
-    -- how many history samples are kept. The window they cover is
-    -- FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency, which has to reach MAX_LATENCY.
+    -- how many history samples are kept. The rewind window they cover is
+    -- (FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency seconds, and MAX_LATENCY is
+    -- derived from it below. Raise this to rewind further back.
     FRAME_CAP = 20,
     -- capture one sample every N simulation steps. Roblox replicates player characters at about
     -- 20Hz, so capturing at 60 stored two duplicates for every real sample. A rewind resolves by
@@ -73,7 +74,6 @@ local Settings = {
 
     LATENCY_OFFSET = 0, -- seconds added to the clamped latency measurement before it's stored
     LATENCY_SAMPLE_WINDOW = 5, -- number of recent remote reports averaged into the latency attribute
-    MAX_LATENCY = 1, -- seconds; clamps client-reported latency stamps (must not exceed the history window, see FRAME_CAP)
     LATENCY_DUMMY_HIDE_OFFSET = Vector3.new(0, 13337, 0), -- moves the latency-measurement rig out of the playable map
     LATENCY_ORBIT_RADIUS = 25, -- radius (studs) of the circle the latency dummies spin around
     LATENCY_ANGLE_EPSILON = math.rad(0.1), -- how close (radians) the delayed dummy's angle needs to be to the predicted dummy's recorded angle to count as "reached"
@@ -87,4 +87,43 @@ local Settings = {
 }
 
 
-return Settings
+--The clamp on a client-reported latency stamp, in seconds.
+--
+--This used to be a hand-set number, which meant it could quietly disagree with the history it has
+--to be resolved against. A stamp older than the oldest surviving sample has no pair of samples to
+--bracket between, so the rewind lands on the end of the window instead of where the client was,
+--and nothing reports that it happened.
+--
+--So it is derived rather than configured. A sample is captured every HISTORY_CAPTURE_DIVISOR
+--steps and the ring holds FRAME_CAP of them, so the reachable span is FRAME_CAP - 1 intervals:
+--the worst case is the instant after a capture, when the oldest slot has just been overwritten.
+--At the defaults that is 19 * 3 / 60 = 0.95s, where a hand-set 1s was 0.05s too generous.
+--
+--It is read through __index rather than stored, so it stays correct when FRAME_CAP, the divisor,
+--or StepFrequency are changed before Central.Start().
+local function maxLatency(): number
+    --the rate is encoded in the enum item's name (Hz60, Hz30, ...)
+    local hz = tonumber(Settings.StepFrequency.Name:match("%d+")) or 60
+    return (Settings.FRAME_CAP - 1) * Settings.HISTORY_CAPTURE_DIVISOR / hz
+end
+
+export type Settings = typeof(Settings) & {MAX_LATENCY: number}
+
+return (setmetatable(Settings, {
+    __index = function(_, key: string): any
+        if key == "MAX_LATENCY" then
+            return maxLatency()
+        end
+        return nil
+    end,
+
+    --without this a `Settings.MAX_LATENCY = n` would rawset straight past the getter and put the
+    --old disagreement back, silently and permanently
+    __newindex = function(self, key: string, value: any)
+        if key == "MAX_LATENCY" then
+            warn("[Central] MAX_LATENCY is derived from FRAME_CAP, HISTORY_CAPTURE_DIVISOR and StepFrequency; change those instead. Ignoring.")
+            return
+        end
+        rawset(self :: any, key, value)
+    end,
+}) :: any) :: Settings

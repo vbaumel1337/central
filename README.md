@@ -213,8 +213,11 @@ the number hitbox history gets rewound by.
 
 **The measurement is client-reported.** The server clamps and sanity-checks
 it but doesn't independently verify it, so a modified client can influence
-how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
-`MAX_LATENCY` as the security-relevant knob if that matters for your game.
+how far back its own shots are rewound, bounded by `MAX_LATENCY`. That bound
+is not a knob: it is derived from the history window (see
+[History storage](#history-storage)), so shrinking how far a client can push
+its own rewind means lowering `FRAME_CAP` or `HISTORY_CAPTURE_DIVISOR`, which
+shortens the window itself rather than clamping against one that outlasts it.
 
 ## History storage
 
@@ -222,9 +225,21 @@ History is sampled on its own cadence, not once per simulation step. Roblox
 replicates player characters at roughly 20 Hz, so capturing at 60 stored two
 duplicates for every real sample. `Settings.HISTORY_CAPTURE_DIVISOR` (default
 `3`) captures one sample every N steps, and `FRAME_CAP` (default `20`) is how
-many samples are kept. The window they span is
-`FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency`, and it has to reach
-`MAX_LATENCY` — at the defaults that is exactly one second.
+many samples are kept.
+
+`Settings.MAX_LATENCY` is derived from those two rather than set by hand, so
+the clamp on a rewind can never outrun the history it has to resolve against.
+The reachable span is `FRAME_CAP - 1` capture intervals, not `FRAME_CAP`: the
+worst case is the instant after a capture, when the oldest slot has just been
+overwritten. That is
+`(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency`, or `19 * 3 / 60`
+= **0.95s** at the defaults. Widen the window by raising `FRAME_CAP`, and
+`MAX_LATENCY` follows.
+
+A stamp older than the oldest surviving sample is the failure this prevents:
+it has no pair of samples to bracket between, so the rewind lands on the end
+of the window instead of where the client actually was, and nothing reports
+that it happened.
 
 A longer interval only works because a rewind no longer snaps to a sample. The
 player's latency resolves to the two samples it falls between plus how far
@@ -414,7 +429,7 @@ runtime, is the safe way to change a default.
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
-| `FRAME_CAP` | `20` | How many history samples are kept. The window they span is `FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency`, and has to reach `MAX_LATENCY` (20 × 3 @ 60 Hz = 1s). |
+| `FRAME_CAP` | `20` | How many history samples are kept. The rewind window they span is `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` (19 × 3 @ 60 Hz = 0.95s), and `MAX_LATENCY` is derived from it. |
 | `HISTORY_CAPTURE_DIVISOR` | `3` | Capture one history sample every N simulation steps. Roblox replicates characters at ~20 Hz, so capturing every step at 60 stored duplicates. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
 | `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
 | `HISTORY_BACKEND` | `"trees"` | `"trees"` keeps one AABB tree per history sample. `"refit"` is the prototype: one shared topology with per-sample bounds refit bottom-up. |
@@ -426,7 +441,7 @@ runtime, is the safe way to change a default.
 | `TREE_REBUILD_CHECK_JITTER` | `0.2` | `"trees"` backend only. Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
 | `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before clamp/average; bias compensation earlier/later. |
 | `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. |
-| `MAX_LATENCY` | `1` | Upper clamp (s) on a reported latency sample; also bounds how far a modified client can push its own rewind. |
+| `MAX_LATENCY` | *derived* (`0.95`) | Read-only. Upper clamp (s) on a reported latency sample, and the bound on how far a modified client can push its own rewind. Computed as `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` on every read, so it tracks those three. Assigning to it warns and is ignored. |
 | `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the latency measurement rig is parked, off-map. |
 | `LATENCY_ORBIT_RADIUS` | `25` | Radius (studs) of the circle the two latency dummies walk. |
 | `LATENCY_ANGLE_EPSILON` | `math.rad(0.1)` | How close the delayed dummy must get to the predicted dummy's recorded angle to count as caught up. |
