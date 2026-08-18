@@ -99,18 +99,26 @@ local OwnedHitboxParts = {} :: {[Player]: {BasePart}}
 local PlayerLatencies = {} :: {[Player]: number}
 local stepsSinceCapture = 0
 
+--the ring index is 0 until the first capture and every history slot is 1-based, so anything
+--resolving to "now" has to land on a real slot. Slot 1 is empty before the first capture, which
+--is the right answer at that point anyway. UpdateFrame is exempt: it runs straight after Step.
+local function newestIndex(): number
+	local index = GlobalTimeRegister.index
+	return if index == 0 then 1 else index
+end
+
 --resolved per query rather than per step: most players are not querying on any given frame, and
 --sampling at query time is if anything fresher than sampling at the last step boundary.
 --Returns the older sample, the newer one to blend toward, and how far between them the rewind is.
 local function resolveRewind(player: Player): (number, number?, number)
 	local latency = PlayerLatencies[player]
 	if not latency then
-		return GlobalTimeRegister.index, nil, 0
+		return newestIndex(), nil, 0
 	end
 
 	local older, newer, alpha = GlobalTimeRegister:GetBracketAtTime(time() - latency)
 	if not older then
-		return GlobalTimeRegister.index, nil, 0
+		return newestIndex(), nil, 0
 	end
 
 	return older, newer, alpha
@@ -284,19 +292,19 @@ end
 --rewound to what this player saw, but their own character is not, so these resolve at the newest
 --sample with no blend and no widening.
 function CentralServer.QueryOwnedRaycast(player: Player, ray_origin: Vector3, ray_direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
-	return HistoricalIndex:QueryRaycast(player, GlobalTimeRegister.index, nil, 0, 0, ray_origin, ray_direction, params, check, true)
+	return HistoricalIndex:QueryRaycast(player, newestIndex(), nil, 0, 0, ray_origin, ray_direction, params, check, true)
 end
 
 function CentralServer.QueryOwnedShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
-	return HistoricalIndex:QueryShapecast(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, direction, params, check, true)
+	return HistoricalIndex:QueryShapecast(player, newestIndex(), nil, 0, 0, cframe, shape, direction, params, check, true)
 end
 
 function CentralServer.QueryOwnedSimpleShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, number?)
-	return HistoricalIndex:QuerySimpleShapecast(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, direction, params, check, true)
+	return HistoricalIndex:QuerySimpleShapecast(player, newestIndex(), nil, 0, 0, cframe, shape, direction, params, check, true)
 end
 
 function CentralServer.QueryOwnedShape(player: Player, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: HistoricalHitboxes.Hitbox}
-	return HistoricalIndex:QueryShape(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, params, check, true)
+	return HistoricalIndex:QueryShape(player, newestIndex(), nil, 0, 0, cframe, shape, params, check, true)
 end
 
 function CentralServer.HasOwnedHitboxes(player: Player): boolean

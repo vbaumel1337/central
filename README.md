@@ -8,9 +8,12 @@ that raycasts/shapecasts issued against a player are resolved against where
 that player actually saw the world, not just the current frame. It measures
 each player's perceived replication delay automatically (see
 [How Character Latency Is Measured](#how-character-latency-is-measured)) and
-rewinds hitbox history to match. Queries are resolved against an AABB tree
-per historical frame, using the [Bolt](https://github.com/unityjaeger/Bolt)
-library for the collision-detection math.
+rewinds hitbox history to match. History is sampled on its own cadence rather
+than every simulation step, and a rewind is blended between the two samples it
+falls between rather than snapped to the nearest one. Queries are resolved
+against an AABB tree per historical sample, using the
+[Bolt](https://github.com/unityjaeger/Bolt) library for the collision-detection
+math.
 
 ## Installation
 
@@ -71,8 +74,11 @@ Only these `RaycastParams`/`OverlapParams` properties are honored:
 `IncludeInstances`, and (overlap only) `MaxParts`.
 
 `querySettings` (server only): `{ frameRange: number?, check: ((BasePart) -> boolean)? }`
-- `frameRange`: extra frames around the player's latency-resolved frame to
-  search. Defaults to `Settings.RAYCAST_FRAME_RANGE` for `Raycast`,
+- `frameRange`: extra history samples either side of the pair the player's
+  latency resolves between. The rewind is already blended to the exact time
+  between those two samples, so this only matters for hitboxes that move far
+  enough within one capture interval that neither sample's bounds contain them.
+  Defaults to `Settings.RAYCAST_FRAME_RANGE` for `Raycast`,
   `Settings.COLLISION_FRAME_RANGE` for the rest.
 - `check`: a `(part: BasePart) -> boolean` filter for candidate hits. On
   `Raycast`/`Shapecast`/`SimpleShapecast` it also makes the live cast pierce
@@ -164,8 +170,10 @@ firing player's own latency, so both sides usually land on the same hit
 - Only apply real effects (damage, destroying a part) `if isServer`. The
   client's call is just local feedback.
 - Widen `querySettings.frameRange` if jitter is causing disagreements.
-- A hitbox owned by the querying player is checked live instead of
-  historically, on both realms.
+- A hitbox owned by the querying player is never rewound: it resolves at the
+  newest history sample rather than at that player's latency. Set
+  `Settings.OWNED_HITBOX_SOURCE = "live"` to resolve it with a second
+  `workspace` query against true engine geometry instead.
 - Something that moves every step (e.g. a projectile shapecast each frame)
   should use a registered **query** group, not a hitbox group, so it
   doesn't physically collide with hitboxes and all its hit detection goes
@@ -195,6 +203,13 @@ how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
 `MAX_LATENCY` as the security-relevant knob if that matters for your game.
 
 ## Performance
+
+> **Stale.** These numbers were measured before history capture was decoupled
+> from the simulation step, before the per-candidate query filter was hoisted,
+> and before owned hitboxes moved onto the history path. They describe the
+> shipping backend at the old defaults (`FRAME_CAP = 60`, capture every step,
+> frame ranges of `1`). The scaling behaviour still holds; the absolute figures
+> do not. Re-measure before quoting them.
 
 Measured server-side in Studio: a 3×3×3 grid of anchored hitbox parts
 (7 studs apart), all moved and all 60 history frames populated every frame,
@@ -296,7 +311,7 @@ runtime, is the safe way to change a default.
 |---|---|---|
 | `DEBUG_MODE` | `false` | Draws rays/hitboxes for every query, and gates the `Show`/`Hide`Hitboxes functions. Costs performance, leave off outside debugging. |
 | `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. |
-| `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop records a hitbox frame and recomputes rewound indices. |
+| `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop runs. History is captured every `HISTORY_CAPTURE_DIVISOR` of those steps. |
 | `HitboxStepPriority` | `1000` | Priority Central's internal binding runs at; your own query-calling bindings need a higher number. |
 | `AUTO_ADD_CHARACTERS` | `true` | Auto-tags every part of a spawning player's character as an owned hitbox. |
 | `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | Fallback query group for an unregistered `CollisionGroup`. |
@@ -306,9 +321,13 @@ runtime, is the safe way to change a default.
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
-| `FRAME_CAP` | `60` | Size of the history ring buffer; bounds how far back Central can rewind (60 @ 60 Hz ≈ 1s). |
-| `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Raycast`. |
-| `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
+| `FRAME_CAP` | `20` | How many history samples are kept. The window they span is `FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency`, and has to reach `MAX_LATENCY` (20 × 3 @ 60 Hz = 1s). |
+| `HISTORY_CAPTURE_DIVISOR` | `3` | Capture one history sample every N simulation steps. Roblox replicates characters at ~20 Hz, so capturing every step at 60 stored duplicates. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
+| `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
+| `HISTORY_BACKEND` | `"trees"` | `"trees"` keeps one AABB tree per history sample. `"refit"` is the prototype: one shared topology with per-sample bounds refit bottom-up. |
+| `HISTORY_REFIT_BUDGET` | `4` | `refit` backend only. How many stale samples each capture re-refits, spreading the cost of a topology change. |
+| `RAYCAST_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Raycast`. |
+| `COLLISION_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
 | `PREFER_NEAREST_FRAME` | `true` | Tie-break when several frames in range produce a hit: `true` = nearest frame wins regardless of distance; `false` = spatially closest wins, ties to nearer frame. |
 | `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. |
 | `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
@@ -322,7 +341,7 @@ runtime, is the safe way to change a default.
 | `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds between measurement cycles. |
 | `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a flush hitbox still registers. |
 | `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
-| `AABB_PADDING` | `1` | Padding (studs) around each hitbox's bounding box in the AABB tree, giving queries slack before a partial rebuild is needed. |
+| `AABB_PADDING` | `1` | Padding (studs) around each hitbox's bounding box in the AABB tree, giving queries slack before a partial rebuild is needed. Ignored by the `refit` backend, which stores exact bounds. |
 
 ## Third-party code
 
