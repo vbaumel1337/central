@@ -280,6 +280,30 @@ function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt
 	return results
 end
 
+--The querying player's own hitboxes are the other half of a merged result: everyone else is
+--rewound to what this player saw, but their own character is not, so these resolve at the newest
+--sample with no blend and no widening.
+function CentralServer.QueryOwnedRaycast(player: Player, ray_origin: Vector3, ray_direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
+	return HistoricalIndex:QueryRaycast(player, GlobalTimeRegister.index, nil, 0, 0, ray_origin, ray_direction, params, check, true)
+end
+
+function CentralServer.QueryOwnedShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
+	return HistoricalIndex:QueryShapecast(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, direction, params, check, true)
+end
+
+function CentralServer.QueryOwnedSimpleShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, number?)
+	return HistoricalIndex:QuerySimpleShapecast(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, direction, params, check, true)
+end
+
+function CentralServer.QueryOwnedShape(player: Player, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: HistoricalHitboxes.Hitbox}
+	return HistoricalIndex:QueryShape(player, GlobalTimeRegister.index, nil, 0, 0, cframe, shape, params, check, true)
+end
+
+function CentralServer.HasOwnedHitboxes(player: Player): boolean
+	local owned = OwnedHitboxParts[player]
+	return owned ~= nil and #owned > 0
+end
+
 function CentralServer.GetPredictedHitboxes(player: Player, ownerName: string) : {HistoricalHitboxes.Hitbox}
 	local centerIndex = resolveRewind(player)
 	return HistoricalIndex:GetHitboxesForOwner(centerIndex, ownerName)

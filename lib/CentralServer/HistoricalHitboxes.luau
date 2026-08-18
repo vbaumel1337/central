@@ -57,10 +57,10 @@ export type HistoricalHitboxes = typeof(setmetatable(
 		AddPart: (self: any, register: PartRegister.PartRegister) -> (),
 		RemovePart: (self: any, part: BasePart) -> (),
 		UpdateFrame: (self: any, index: number) -> (),
-		QueryRaycast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?) -> (Hitbox?, Vector3?, number?, Vector3?),
-		QueryShapecast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?) -> (Hitbox?, Vector3?, number?, Vector3?),
-		QuerySimpleShapecast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?) -> (Hitbox?, number?),
-		QueryShape: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?) -> {[BasePart]: Hitbox},
+		QueryRaycast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?) -> (Hitbox?, Vector3?, number?, Vector3?),
+		QueryShapecast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?) -> (Hitbox?, Vector3?, number?, Vector3?),
+		QuerySimpleShapecast: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?) -> (Hitbox?, number?),
+		QueryShape: (self: any, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?) -> {[BasePart]: Hitbox},
 		GetHitboxesForOwner: (self: any, index: number, ownerName: string) -> {Hitbox},
 		Destroy: (self: any) -> (),
 	},
@@ -220,9 +220,11 @@ local function posedCFrame(
 	return anchor.cframe:Lerp(other.cframe, alpha)
 end
 
-function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
+function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?): (Hitbox?, Vector3?, number?, Vector3?)
 	local playerName = player.Name
 	local filter = QueryFilter.resolve(params)
+	--the querying player's own hitboxes are the other half of a merged result, never both
+	local wantOwned = ownedOnly == true
 	local invLength = fractionScale(rayDirection)
 
 	local centerHitboxes = self.hitboxes[centerIndex]
@@ -242,7 +244,7 @@ function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Playe
 
 		self.trees[index]:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -294,13 +296,15 @@ function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Playe
 	return resultHitbox, bestPoint, bestDistance, bestNormal
 end
 
-function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
+function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?): (Hitbox?, Vector3?, number?, Vector3?)
 	if direction.Magnitude < 1e-6 then
 		return nil, nil, nil, nil
 	end
 
 	local playerName = player.Name
 	local filter = QueryFilter.resolve(params)
+	--the querying player's own hitboxes are the other half of a merged result, never both
+	local wantOwned = ownedOnly == true
 	local invLength = fractionScale(direction)
 
 	local centerHitboxes = self.hitboxes[centerIndex]
@@ -319,7 +323,7 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 
 		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -369,13 +373,15 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 	return resultHitbox, bestPoint, bestDistance, bestNormal
 end
 
-function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, number?)
+function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?): (Hitbox?, number?)
 	if direction.Magnitude < 1e-6 then
 		return nil, nil
 	end
 
 	local playerName = player.Name
 	local filter = QueryFilter.resolve(params)
+	--the querying player's own hitboxes are the other half of a merged result, never both
+	local wantOwned = ownedOnly == true
 	local invLength = fractionScale(direction)
 
 	local centerHitboxes = self.hitboxes[centerIndex]
@@ -392,7 +398,7 @@ function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, playe
 
 		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				return nil
 			end
 
@@ -452,9 +458,11 @@ local function collides(hitbox: Hitbox, hitboxCFrame: CFrame, cframe: CFrame, sh
 	return gjk.intersects(hitboxCFrame, hitbox.shape, cframe, shape, GJK_TOLERANCE)
 end
 
-function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: Hitbox}
+function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player, centerIndex: number, blendIndex: number?, blendAlpha: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?, ownedOnly: boolean?): {[BasePart]: Hitbox}
 	local playerName = player.Name
 	local filter = QueryFilter.resolve(params)
+	--the querying player's own hitboxes are the other half of a merged result, never both
+	local wantOwned = ownedOnly == true
 	local results: {[BasePart]: Hitbox} = {}
 	local partCount = 0
 	local maxParts = (params and params.MaxParts) or math.huge
@@ -467,7 +475,7 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 		local frameHitboxes = self.hitboxes[index]
 		for _, id in self.trees[index]:query_shape(cframe, shape) do
 			local hitbox = frameHitboxes[id]
-			if not hitbox or hitbox.owner == playerName or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 				continue
 			end
 

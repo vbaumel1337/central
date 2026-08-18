@@ -45,6 +45,19 @@ local Settings = {
     -- which history backend CentralServer builds: "trees" is the shipping one (one dynamic tree
     -- per historical frame), "refit" is the prototype (one shared topology, per-frame bounds
     -- refit bottom-up). Both expose the same interface and the same query semantics.
+    -- where the querying player's OWN hitboxes are resolved. They are never lag compensated
+    -- (a player sees their own character where the server has it), so either way they resolve at
+    -- "now"; this only picks which structure answers.
+    --   "history" - the history structure at its newest sample. One traversal, filters handled
+    --               internally, and `check` costs nothing extra. Owned parts resolve against the
+    --               same box approximation as everyone else's, and are up to one capture interval
+    --               stale rather than live.
+    --   "live"    - a second workspace query with IncludeInstances set to the owned parts. True
+    --               engine geometry and genuinely current, at the cost of marshalling the include
+    --               list per query and, when `check` is set, an iterative exclude-and-retry loop.
+    -- Prefer "live" if you tag fast movers (projectiles, vehicles) or non-box shapes as hitboxes.
+    OWNED_HITBOX_SOURCE = "history" :: "history" | "live",
+
     HISTORY_BACKEND = "trees" :: "trees" | "refit",
     -- refit backend only: how many stale history slots UpdateFrame re-refits per frame. A part
     -- being added or removed restructures the shared topology and invalidates every slot's

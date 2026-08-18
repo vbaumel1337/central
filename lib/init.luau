@@ -20,6 +20,10 @@ local visualizer = require(script.visualizer)
 local Settings = require(script.Settings)
 
 local RAYCAST_MARGIN = Settings.RAYCAST_MARGIN
+local OWNED_SOURCE = Settings.OWNED_HITBOX_SOURCE
+--stands in for the owned part list when owned hitboxes are resolved through the history
+--path instead, so the live merges below collapse without a branch of their own
+local NO_OWNED: {BasePart} = {}
 
 local DEBUG_MODE = Settings.DEBUG_MODE
 local DEBUG_LIFETIME = Settings.DEBUG_LIFETIME
@@ -338,7 +342,7 @@ local function liveHitboxAwareRaycast(player: Player, origin: Vector3, direction
         result = workspace:Raycast(origin, direction, blanket)
     end
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
+    local owned = if OWNED_SOURCE == "live" then CentralServer.GetOwnedHitboxParts(player) else NO_OWNED
     if #owned > 0 then
         local ownedParams = RaycastParams.new()
         if params then
@@ -398,7 +402,7 @@ local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) 
     end
     local result = queryFn(blanket)
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
+    local owned = if OWNED_SOURCE == "live" then CentralServer.GetOwnedHitboxParts(player) else NO_OWNED
     if #owned > 0 then
         local ownedParams = OverlapParams.new()
         if params then
@@ -459,7 +463,7 @@ local function liveHitboxAwareShapecast(player: Player, part: Part, direction: V
         result = workspace:Shapecast(part, direction, blanket)
     end
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
+    local owned = if OWNED_SOURCE == "live" then CentralServer.GetOwnedHitboxParts(player) else NO_OWNED
     if #owned > 0 then
         local ownedParams = RaycastParams.new()
         if params then
@@ -517,6 +521,19 @@ function Central.Raycast(player:Player, origin:Vector3, direction:Vector3, rayca
     if isServer then
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN)  else direction
 
+        --the player's own hitboxes are not rewound, so they resolve first and tighten the cast
+        --that the compensated query then has to search
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            local ownedHitbox, ownedPoint, ownedDistance, ownedNormal = CentralServer.QueryOwnedRaycast(player, origin, newDirection, raycastParams, check)
+            if ownedHitbox and (not distance or (ownedDistance :: number) < distance) then
+                distance = ownedDistance
+                instance = ownedHitbox.instance
+                position = ownedPoint
+                normal = ownedNormal
+                newDirection = direction.Unit*((distance :: number)+RAYCAST_MARGIN)
+            end
+        end
+
         local hitbox, hitPoint, hitDistance, hitNormal = CentralServer.QueryPlayerRaycast(player, origin, newDirection, querySettings and querySettings.frameRange, raycastParams, check)
         if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
@@ -558,7 +575,20 @@ function Central.Shapecast(player:Player, part:Part, direction:Vector3, raycastP
     if isServer then
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
-        local hitbox, hitPoint, hitDistance, hitNormal = CentralServer.QueryPlayerShapecast(player, part.CFrame, bolt.create_from_part(part), newDirection, querySettings and querySettings.frameRange, raycastParams, check)
+        local castShape = bolt.create_from_part(part)
+
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            local ownedHitbox, ownedPoint, ownedDistance, ownedNormal = CentralServer.QueryOwnedShapecast(player, part.CFrame, castShape, newDirection, raycastParams, check)
+            if ownedHitbox and (not distance or (ownedDistance :: number) < distance) then
+                distance = ownedDistance
+                instance = ownedHitbox.instance
+                position = ownedPoint
+                normal = ownedNormal
+                newDirection = direction.Unit*((distance :: number)+RAYCAST_MARGIN)
+            end
+        end
+
+        local hitbox, hitPoint, hitDistance, hitNormal = CentralServer.QueryPlayerShapecast(player, part.CFrame, castShape, newDirection, querySettings and querySettings.frameRange, raycastParams, check)
         if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
             instance = hitbox.instance
@@ -598,7 +628,18 @@ function Central.SimpleShapecast(player:Player, part:Part, direction:Vector3, ra
     if isServer then
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
-        local hitbox, hitDistance = CentralServer.QueryPlayerSimpleShapecast(player, part.CFrame, bolt.create_from_part(part), newDirection, querySettings and querySettings.frameRange, raycastParams, check)
+        local castShape = bolt.create_from_part(part)
+
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            local ownedHitbox, ownedDistance = CentralServer.QueryOwnedSimpleShapecast(player, part.CFrame, castShape, newDirection, raycastParams, check)
+            if ownedHitbox and (not distance or (ownedDistance :: number) < distance) then
+                distance = ownedDistance
+                instance = ownedHitbox.instance
+                newDirection = direction.Unit*((distance :: number)+RAYCAST_MARGIN)
+            end
+        end
+
+        local hitbox, hitDistance = CentralServer.QueryPlayerSimpleShapecast(player, part.CFrame, castShape, newDirection, querySettings and querySettings.frameRange, raycastParams, check)
         if hitbox and (not distance or (hitDistance :: number) < distance) then
             distance = hitDistance
             instance = hitbox.instance
@@ -628,8 +669,14 @@ function Central.GetBoundsInRadius(player:Player, position:Vector3, radius:numbe
 
 
     if isServer then
-        local serverResult = CentralServer.QueryPlayerShape(player, CFrame.new(position), bolt.create_sphere(radius), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        mergeSetUnique(result, serverResult)
+        local queryCFrame, queryShape = CFrame.new(position), bolt.create_sphere(radius)
+        local overlapCheck = querySettings and querySettings.check
+
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            mergeSetUnique(result, CentralServer.QueryOwnedShape(player, queryCFrame, queryShape, overlapParams, overlapCheck))
+        end
+
+        mergeSetUnique(result, CentralServer.QueryPlayerShape(player, queryCFrame, queryShape, querySettings and querySettings.frameRange, overlapParams, overlapCheck))
     end
 
     if DEBUG_MODE and #result > 0 then
@@ -654,8 +701,14 @@ function Central.GetPartBoundsInBox(player:Player, cframe:CFrame, size:Vector3, 
 
 
     if isServer then
-        local serverResult = CentralServer.QueryPlayerShape(player, cframe, bolt.create_box(size), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        mergeSetUnique(result, serverResult)
+        local queryCFrame, queryShape = cframe, bolt.create_box(size)
+        local overlapCheck = querySettings and querySettings.check
+
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            mergeSetUnique(result, CentralServer.QueryOwnedShape(player, queryCFrame, queryShape, overlapParams, overlapCheck))
+        end
+
+        mergeSetUnique(result, CentralServer.QueryPlayerShape(player, queryCFrame, queryShape, querySettings and querySettings.frameRange, overlapParams, overlapCheck))
     end
 
     if DEBUG_MODE and #result > 0 then
@@ -679,8 +732,14 @@ function Central.GetPartsInPart(player:Player, part:Part, overlapParams:OverlapP
         else workspace:GetPartsInPart(part, overlapParams)
 
     if isServer then
-        local serverResult = CentralServer.QueryPlayerShape(player, part.CFrame, bolt.create_from_part(part), querySettings and querySettings.frameRange, overlapParams, querySettings and querySettings.check)
-        mergeSetUnique(result, serverResult)
+        local queryCFrame, queryShape = part.CFrame, bolt.create_from_part(part)
+        local overlapCheck = querySettings and querySettings.check
+
+        if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
+            mergeSetUnique(result, CentralServer.QueryOwnedShape(player, queryCFrame, queryShape, overlapParams, overlapCheck))
+        end
+
+        mergeSetUnique(result, CentralServer.QueryPlayerShape(player, queryCFrame, queryShape, querySettings and querySettings.frameRange, overlapParams, overlapCheck))
     end
 
     if DEBUG_MODE and #result > 0 then
