@@ -31,6 +31,15 @@ local Settings = {
     -- false = the spatially closest hit across all frames in range wins (ties go to the nearer frame)
     PREFER_NEAREST_FRAME = true,
 
+    -- which history backend CentralServer builds: "trees" is the shipping one (one dynamic tree
+    -- per historical frame), "refit" is the prototype (one shared topology, per-frame bounds
+    -- refit bottom-up). Both expose the same interface and the same query semantics.
+    HISTORY_BACKEND = "trees" :: "trees" | "refit",
+    -- refit backend only: how many stale history slots UpdateFrame re-refits per frame. A part
+    -- being added or removed restructures the shared topology and invalidates every slot's
+    -- internal nodes at once, and this spreads that cost instead of landing it on one query.
+    HISTORY_REFIT_BUDGET = 4,
+
     -- seconds between should_rebuild checks on each historical tree. the check is a full scan over
     -- the tree's nodes, so running it on every frame update is wasteful when the trees stay balanced
     TREE_REBUILD_CHECK_INTERVAL = 10,

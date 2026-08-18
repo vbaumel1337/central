@@ -9,6 +9,7 @@ local Registers = script.Registers
 local TimeRegister = require(Registers.TimeRegister)
 local Observers = require(script.Parent.Parent.Observers)
 local HistoricalHitboxes = require(script.HistoricalHitboxes)
+local HistoricalRefit = require(script.HistoricalRefit)
 local PartRegister = require(script.Registers.PartRegister)
 local Settings = require(script.Parent.Settings)
 export type Hitbox = HistoricalHitboxes.Hitbox
@@ -84,7 +85,11 @@ end
 local GlobalTimeRegister = TimeRegister.new(FRAME_CAP, 0)
 --local CharacterRegisters = {} :: {[Player]: CharacterRegister.CharacterRegister}
 local PartRegisters = {} :: {[BasePart]:PartRegister.PartRegister}
-local HistoricalIndex = HistoricalHitboxes.new(FRAME_CAP, Settings.AABB_PADDING)
+--both backends expose the same interface; the cast keeps every use site below typed against the
+--shipping one instead of degrading to any
+local HistoricalIndex: HistoricalHitboxes.HistoricalHitboxes = if Settings.HISTORY_BACKEND == "refit"
+	then (HistoricalRefit.new(FRAME_CAP, Settings.AABB_PADDING) :: any)
+	else HistoricalHitboxes.new(FRAME_CAP, Settings.AABB_PADDING)
 
 local RegistersPending:{PartRegister.PartRegister} = {}
 
