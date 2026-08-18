@@ -261,10 +261,7 @@ have hitboxes like that.
 identical query semantics and results; they differ only in what they keep per
 sample.
 
-**`"trees"`** (default, shipping) keeps one bolt dynamic tree per sample. Each
-capture rewrites one of them with the current pose of every hitbox.
-
-**`"refit"`** (prototype) separates the two things a BVH holds. Topology — which
+**`"refit"`** (default) separates the two things a BVH holds. Topology — which
 leaves are siblings — is expensive and changes slowly, so one tree owns it and
 is mutated only when a part is added or removed, plus an occasional rebuild for
 quality. Bounds are cheap and change every capture, so each sample stores
@@ -273,6 +270,11 @@ capture writes each part's exact AABB into its leaf slot and runs one bottom-up
 pass to fill the internal nodes: linear, no restructuring, no allocation.
 Queries point the tree's bounds arrays at the sample being queried, so the
 broad phase is bolt's own traversal, unmodified.
+
+**`"trees"`** keeps one bolt dynamic tree per sample, and each capture rewrites
+one of them with the current pose of every hitbox. This is the original
+implementation, kept as an escape hatch and as the reference `"refit"` is
+differentially tested against.
 
 Only the grouping is shared across samples. The boxes a query tests are still
 each sample's exact per-part AABBs, so they are as tight as the per-sample
@@ -283,38 +285,57 @@ each other in the one sample being queried. `"refit"` also ignores
 
 ## Performance
 
-> **None of this branch has been run in Roblox.** It compiles, and the two new
-> algorithms (bounds refit and rewind bracketing) pass standalone tests, but
-> nothing here has been executed in a live game or timed. Treat it as untested.
+Measured server-side in Roblox Studio. `"refit"` was checked against `"trees"`
+before being timed — 544 query comparisons spanning raycast, bracket-blended
+raycast, widened raycast, shapecast and overlap, plus a 60-slot run with parts
+added and removed mid-history to exercise topology changes, with zero result
+mismatches. The two backends are interchangeable, so the figures below compare
+like with like.
 
-The figures in this section are a **baseline taken before this branch**. They
-are kept because the scaling behaviour they show still holds and it is what the
-changes were aimed at, but the absolute numbers no longer describe the code:
-since they were measured, history capture was decoupled from the simulation
-step, the per-candidate query filter was hoisted out of the narrow phase, owned
-hitboxes moved onto the history path, and the per-part shadow ring was deleted.
+### Capture cost
 
-### What to measure
+`UpdateFrame` dominated the old profile: at 800 hitboxes it was 10.4% of a
+60 Hz frame with no casts at all, so roughly nine tenths of the cost was
+maintaining history rather than querying it. That is what this branch went
+after.
 
-`UpdateFrame` dominated the old profile. At 800 hitboxes it was 10.4% of a
-60 Hz frame with zero casts, and 100 raycasts on top only took that to 13.2%,
-so roughly nine tenths of the cost was maintaining history rather than querying
-it. Everything on this branch aims there. The measurements worth taking:
+| hitboxes | `"trees"` per capture | `"refit"` per capture | speedup | `"trees"` per hitbox | `"refit"` per hitbox |
+|---|---|---|---|---|---|
+| 50 | 52.8 µs | 8.4 µs | 6.3× | 1.056 µs | 0.168 µs |
+| 100 | 127.9 µs | 17.9 µs | 7.2× | 1.279 µs | 0.179 µs |
+| 200 | 287.4 µs | 39.1 µs | 7.4× | 1.437 µs | 0.195 µs |
+| 400 | 614.8 µs | 73.0 µs | 8.4× | 1.537 µs | 0.183 µs |
+| 800 | 1369.0 µs | 145.7 µs | 9.4× | 1.711 µs | 0.182 µs |
 
-| Measurement | What it tells you |
-|---|---|
-| `UpdateFrame` per capture, at 50 / 100 / 200 / 400 / 800 hitboxes | The headline. Compare per-hitbox cost, not just totals. |
-| That same per-hitbox cost as count grows | The old profile climbed 1.38 → 2.16 µs because the tree insert is `O(log N)` with a widening search. Under `"refit"` it should stay flat. If it climbs, the shared-topology approach is not paying off. |
-| `UpdateFrame` frequency against wall time | It now runs once every `HISTORY_CAPTURE_DIVISOR` steps, so amortised per-frame cost should fall by that factor on top of any per-capture win. |
-| Closest-hit query cost, `"trees"` vs `"refit"` | Where a shared topology gets paid for. Queries were ~1 µs and flat in hitbox count; that flatness is the thing to protect. |
-| Query cost with `ExcludeInstances` set, and with `check` set | Where the filter hoist lands. The old path ran a `CollisionGroupsAreCollidable` call plus an `IsDescendantOf` walk per candidate per sample. |
-| Owned-hitbox queries, `OWNED_HITBOX_SOURCE` `"history"` vs `"live"` | The `"live"` path allocates params, marshals an include list, and with `check` set runs an iterative exclude-and-retry loop. |
-| Peak memory / hitbox | `FRAME_CAP` dropped 60 → 20, the shadow ring is gone, and `"refit"` replaces 59 trees with bound arrays. |
+The per-hitbox columns are the point. `"trees"` climbs 1.06 → 1.71 µs because
+every capture reinserts every part and a tree insert is `O(log N)` with a
+widening search, so cost per hitbox rises with the count. `"refit"` holds
+~0.18 µs flat, because the topology is not rebuilt and a capture is a linear
+pass writing bounds. The speedup therefore widens with hitbox count instead of
+converging.
 
-Flip `HISTORY_BACKEND` and `HISTORY_CAPTURE_DIVISOR` to A/B in place; both are
-plain settings and neither changes query semantics.
+That is per capture. `HISTORY_CAPTURE_DIVISOR` (default `3`) then runs one
+capture every three steps rather than every step, so amortised per-frame cost
+falls by roughly another factor of three on top.
 
-### Baseline
+### Query cost
+
+A shared topology is the thing that might have cost query speed: two parts that
+are siblings because they were near each other across the window need not be
+near each other in the one sample being queried. Measured, it does not:
+
+| hitboxes | `"trees"` | `"refit"` |
+|---|---|---|
+| 50 | 0.70 µs | 0.70 µs |
+| 100 | 1.40 µs | 1.00 µs |
+| 200 | 1.60 µs | 0.90 µs |
+| 400 | 1.60 µs | 1.00 µs |
+| 800 | 1.90 µs | 1.00 µs |
+
+Closest-hit queries stay flat in hitbox count under both backends, and
+`"refit"` is equal or faster at every size.
+
+### Older detailed profile
 
 Measured server-side in Studio on the `"trees"` backend at the settings that
 were default at the time: `FRAME_CAP = 60`, a capture every simulation step
@@ -432,7 +453,7 @@ runtime, is the safe way to change a default.
 | `FRAME_CAP` | `20` | How many history samples are kept. The rewind window they span is `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` (19 × 3 @ 60 Hz = 0.95s), and `MAX_LATENCY` is derived from it. |
 | `HISTORY_CAPTURE_DIVISOR` | `3` | Capture one history sample every N simulation steps. Roblox replicates characters at ~20 Hz, so capturing every step at 60 stored duplicates. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
 | `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
-| `HISTORY_BACKEND` | `"trees"` | `"trees"` keeps one AABB tree per history sample. `"refit"` is the prototype: one shared topology with per-sample bounds refit bottom-up. |
+| `HISTORY_BACKEND` | `"refit"` | `"refit"` keeps one shared topology with per-sample bounds refit bottom-up; capture cost stays flat per hitbox. `"trees"` keeps one AABB tree per history sample, the original implementation. Identical query semantics either way. |
 | `HISTORY_REFIT_BUDGET` | `4` | `refit` backend only. How many stale samples each capture re-refits, spreading the cost of a topology change. |
 | `RAYCAST_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Raycast`. |
 | `COLLISION_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |

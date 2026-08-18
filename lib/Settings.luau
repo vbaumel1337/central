@@ -43,9 +43,6 @@ local Settings = {
     -- false = the spatially closest hit across all frames in range wins (ties go to the nearer frame)
     PREFER_NEAREST_FRAME = true,
 
-    -- which history backend CentralServer builds: "trees" is the shipping one (one dynamic tree
-    -- per historical frame), "refit" is the prototype (one shared topology, per-frame bounds
-    -- refit bottom-up). Both expose the same interface and the same query semantics.
     -- where the querying player's OWN hitboxes are resolved. They are never lag compensated
     -- (a player sees their own character where the server has it), so either way they resolve at
     -- "now"; this only picks which structure answers.
@@ -59,7 +56,15 @@ local Settings = {
     -- Prefer "live" if you tag fast movers (projectiles, vehicles) or non-box shapes as hitboxes.
     OWNED_HITBOX_SOURCE = "history" :: "history" | "live",
 
-    HISTORY_BACKEND = "trees" :: "trees" | "refit",
+    -- which history backend CentralServer builds. Both expose the same interface and the same
+    -- query semantics; they differ only in what they keep per sample.
+    --   "refit" - one tree owning topology, mutated only when a part is added or removed, plus a
+    --             pair of bounds arrays per sample refit bottom-up on capture. Capture cost is
+    --             flat per hitbox where "trees" climbs with count, and queries are no slower.
+    --   "trees" - one dynamic tree per sample, rewritten in full every capture. The original
+    --             implementation, kept as an escape hatch and as the reference that "refit" is
+    --             differentially tested against.
+    HISTORY_BACKEND = "refit" :: "trees" | "refit",
     -- refit backend only: how many stale history slots UpdateFrame re-refits per frame. A part
     -- being added or removed restructures the shared topology and invalidates every slot's
     -- internal nodes at once, and this spreads that cost instead of landing it on one query.
