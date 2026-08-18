@@ -22,9 +22,20 @@ local Settings = {
     OWNER_ATTRIBUTE = "HitboxOwner",
     LATENCY_ATTRIBUTE = "PartLatency",
 
-    FRAME_CAP = 60,
-    RAYCAST_FRAME_RANGE = 1,
-    COLLISION_FRAME_RANGE = 1,
+    -- how many history samples are kept. The window they cover is
+    -- FRAME_CAP * HISTORY_CAPTURE_DIVISOR / StepFrequency, which has to reach MAX_LATENCY.
+    FRAME_CAP = 20,
+    -- capture one sample every N simulation steps. Roblox replicates player characters at about
+    -- 20Hz, so capturing at 60 stored two duplicates for every real sample. A rewind resolves by
+    -- blending the two samples it falls between, so a longer interval costs accuracy only for
+    -- parts that move far within it, not for characters.
+    -- Set to 1 to capture every step, which restores the old sampling.
+    HISTORY_CAPTURE_DIVISOR = 3,
+    -- extra samples either side of the resolved bracket to search. The bracket is already the
+    -- exact rewind time, so this exists for hitboxes that move far enough between captures that
+    -- the bracket's own bounds might not contain them.
+    RAYCAST_FRAME_RANGE = 0,
+    COLLISION_FRAME_RANGE = 0,
 
     -- how a closest-hit query picks a winner when several frames in range produce a hit
     -- true  = a hit in a frame nearer the player's estimated index wins outright, regardless of distance
@@ -49,7 +60,7 @@ local Settings = {
 
     LATENCY_OFFSET = 0, -- seconds added to the clamped latency measurement before it's stored
     LATENCY_SAMPLE_WINDOW = 5, -- number of recent remote reports averaged into the latency attribute
-    MAX_LATENCY = 1, -- seconds; clamps client-reported latency stamps (matches FRAME_CAP at Hz60)
+    MAX_LATENCY = 1, -- seconds; clamps client-reported latency stamps (must not exceed the history window, see FRAME_CAP)
     LATENCY_DUMMY_HIDE_OFFSET = Vector3.new(0, 13337, 0), -- moves the latency-measurement rig out of the playable map
     LATENCY_ORBIT_RADIUS = 25, -- radius (studs) of the circle the latency dummies spin around
     LATENCY_ANGLE_EPSILON = math.rad(0.1), -- how close (radians) the delayed dummy's angle needs to be to the predicted dummy's recorded angle to count as "reached"

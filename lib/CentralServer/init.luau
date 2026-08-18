@@ -19,6 +19,7 @@ local bolt = require(script.Parent.bolt)
 local FRAME_CAP = Settings.FRAME_CAP
 local DEFAULT_RAYCAST_RANGE = Settings.RAYCAST_FRAME_RANGE
 local DEFAULT_COLLISION_RANGE = Settings.COLLISION_FRAME_RANGE
+local CAPTURE_DIVISOR = math.max(1, Settings.HISTORY_CAPTURE_DIVISOR)
 
 local CentralServer = {Settings = Settings}
 
@@ -96,7 +97,24 @@ local RegistersPending:{PartRegister.PartRegister} = {}
 local OwnedHitboxParts = {} :: {[Player]: {BasePart}}
 
 local PlayerLatencies = {} :: {[Player]: number}
-local PlayerIndices = {} :: {[Player]: number}
+local stepsSinceCapture = 0
+
+--resolved per query rather than per step: most players are not querying on any given frame, and
+--sampling at query time is if anything fresher than sampling at the last step boundary.
+--Returns the older sample, the newer one to blend toward, and how far between them the rewind is.
+local function resolveRewind(player: Player): (number, number?, number)
+	local latency = PlayerLatencies[player]
+	if not latency then
+		return GlobalTimeRegister.index, nil, 0
+	end
+
+	local older, newer, alpha = GlobalTimeRegister:GetBracketAtTime(time() - latency)
+	if not older then
+		return GlobalTimeRegister.index, nil, 0
+	end
+
+	return older, newer, alpha
+end
 
 function CentralServer.GetOwnedHitboxParts(player: Player): {BasePart}
 	return OwnedHitboxParts[player] or {}
@@ -201,7 +219,6 @@ function CentralServer.Start()
 
 			return function()
 				PlayerLatencies[player] = nil
-				PlayerIndices[player] = nil
 			end
 		end, function(value)
 			return typeof(value) == "number"
@@ -217,52 +234,55 @@ function CentralServer.Start()
 		end
 		table.clear(RegistersPending)
 
+		--history is sampled on its own cadence; a rewind lands between samples and is blended
+		stepsSinceCapture += 1
+		if stepsSinceCapture < CAPTURE_DIVISOR then
+			return
+		end
+		stepsSinceCapture = 0
+
 		GlobalTimeRegister:Step()
 
 		HistoricalIndex:UpdateFrame(GlobalTimeRegister.index)
-
-		for player, characterLatency in PlayerLatencies do
-			PlayerIndices[player] = GlobalTimeRegister:GetIndexAtTime(time() - characterLatency) or GlobalTimeRegister.index
-		end
 
 	end, Settings.StepFrequency, Settings.HitboxStepPriority)
 end
 
 function CentralServer.QueryPlayerRaycast(player:Player, ray_origin:Vector3, ray_direction:Vector3, frameRange:number?, params: RaycastParams?, check: ((BasePart) -> boolean)?) : (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
 	local range = frameRange or DEFAULT_RAYCAST_RANGE
-	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
-	local hitbox, hitPoint, distance, hitNormal = HistoricalIndex:QueryRaycast(player, playerIndex, range, ray_origin, ray_direction, params, check)
+	local centerIndex, blendIndex, blendAlpha = resolveRewind(player)
+	local hitbox, hitPoint, distance, hitNormal = HistoricalIndex:QueryRaycast(player, centerIndex, blendIndex, blendAlpha, range, ray_origin, ray_direction, params, check)
 
 	return hitbox, hitPoint, distance, hitNormal
 end
 
 function CentralServer.QueryPlayerShapecast(player:Player, cframe:CFrame, shape:bolt.Shape, direction:Vector3, frameRange:number?, params: RaycastParams?, check: ((BasePart) -> boolean)?) : (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
 	local range = frameRange or DEFAULT_COLLISION_RANGE
-	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
-	local hitbox, hitPoint, distance, hitNormal = HistoricalIndex:QueryShapecast(player, playerIndex, range, cframe, shape, direction, params, check)
+	local centerIndex, blendIndex, blendAlpha = resolveRewind(player)
+	local hitbox, hitPoint, distance, hitNormal = HistoricalIndex:QueryShapecast(player, centerIndex, blendIndex, blendAlpha, range, cframe, shape, direction, params, check)
 
 	return hitbox, hitPoint, distance, hitNormal
 end
 
 function CentralServer.QueryPlayerSimpleShapecast(player:Player, cframe:CFrame, shape:bolt.Shape, direction:Vector3, frameRange:number?, params: RaycastParams?, check: ((BasePart) -> boolean)?) : (HistoricalHitboxes.Hitbox?, number?)
 	local range = frameRange or DEFAULT_COLLISION_RANGE
-	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
-	local hitbox, distance = HistoricalIndex:QuerySimpleShapecast(player, playerIndex, range, cframe, shape, direction, params, check)
+	local centerIndex, blendIndex, blendAlpha = resolveRewind(player)
+	local hitbox, distance = HistoricalIndex:QuerySimpleShapecast(player, centerIndex, blendIndex, blendAlpha, range, cframe, shape, direction, params, check)
 
 	return hitbox, distance
 end
 
 function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt.Shape, frameRange:number?, params: OverlapParams?, check: ((BasePart) -> boolean)?) : {[BasePart]:HistoricalHitboxes.Hitbox}
 	local range = frameRange or DEFAULT_COLLISION_RANGE
-	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
-	local results = HistoricalIndex:QueryShape(player, playerIndex, range, cframe, shape, params, check)
+	local centerIndex, blendIndex, blendAlpha = resolveRewind(player)
+	local results = HistoricalIndex:QueryShape(player, centerIndex, blendIndex, blendAlpha, range, cframe, shape, params, check)
 
 	return results
 end
 
 function CentralServer.GetPredictedHitboxes(player: Player, ownerName: string) : {HistoricalHitboxes.Hitbox}
-	local playerIndex = PlayerIndices[player] or GlobalTimeRegister.index
-	return HistoricalIndex:GetHitboxesForOwner(playerIndex, ownerName)
+	local centerIndex = resolveRewind(player)
+	return HistoricalIndex:GetHitboxesForOwner(centerIndex, ownerName)
 end
 
 return CentralServer
