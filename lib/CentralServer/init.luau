@@ -211,7 +211,6 @@ function CentralServer.Start()
 	RunService:BindToSimulation(function(delta)
 
 		for _, register in ipairs(RegistersPending) do
-			register.index = GlobalTimeRegister.index
 			PartRegisters[register.part] = register
 			HistoricalIndex:AddPart(register)
 

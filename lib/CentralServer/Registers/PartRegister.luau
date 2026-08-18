@@ -1,119 +1,149 @@
 --!native
 --!strict
 --!optimize 2
+--[[
+	Live state for one tagged hitbox part.
+
+	This used to keep a ring of `frameCap` PartData tables per part, written every step and read
+	back one entry later by UpdateFrame. That ring duplicated `hitboxes[slot]` field for field, so
+	the history structure now reads the part's state straight off this object instead.
+
+	Everything except CFrame is mirrored here by an Observer rather than polled, so a capture costs
+	one property read per part instead of one per field.
+]]
 local Settings = require(script.Parent.Parent.Parent.Settings)
 local Observers = require(script.Parent.Parent.Parent.Parent.Observers)
-local FrameRegister = require(script.Parent.FrameRegister)
 
-local PartRegister = setmetatable({}, FrameRegister)
+local PartRegister = {}
 PartRegister.__index = PartRegister
 
-export type PartData = {
-    cframe: CFrame | false,
-    size: Vector3,
-    canCollide: boolean,
-}
+export type PartRegister = typeof(setmetatable(
+	{} :: {
+		part: BasePart,
+		owner: string,
+		frameCap: number,
 
-export type PartRegister = FrameRegister.FrameRegister<PartData> & typeof(setmetatable(
-    {} :: {
-        _observers: {() -> ()},
-        part: BasePart,
-        owner: string,
-        _currentSize: Vector3,
-        _inWorld: boolean,
-    },
-    PartRegister
+		--mirrored from the instance by observers
+		size: Vector3,
+		canCollide: boolean,
+		collisionGroup: string,
+		inWorld: boolean,
+
+		_observers: {() -> ()},
+		_pendingDestroy: boolean,
+		_destroyCountdown: number,
+		_isDestroyed: boolean,
+		callback: ((self: any) -> ())?,
+
+		Step: (self: any) -> (),
+		ScheduleDestroy: (self: any) -> (),
+		UnscheduleDestroy: (self: any) -> (),
+		Destroy: (self: any) -> (),
+	},
+	PartRegister
 ))
 
-local partCache: {PartRegister} = {}
+function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: PartRegister) -> ())?): PartRegister
+	local self = setmetatable({}, PartRegister) :: PartRegister
 
-local function SaveData(self: PartRegister, data: PartData)
-    if self._inWorld then
-        data.cframe = self.part.CFrame
-    else
-        data.cframe = false
-    end
-    data.size = self._currentSize
-    data.canCollide = self.part.CanCollide
+	self.part = part
+	self.frameCap = frameCap
+	self.callback = callback :: any
+
+	self.size = part.Size
+	self.canCollide = part.CanCollide
+	self.collisionGroup = part.CollisionGroup
+	self.inWorld = part.Parent ~= nil
+
+	self._pendingDestroy = false
+	self._destroyCountdown = 0
+	self._isDestroyed = false
+
+	local owner = part:GetAttribute(Settings.OWNER_ATTRIBUTE)
+	self.owner = if typeof(owner) == "string" then owner else "Server"
+
+	self._observers = {}
+
+	table.insert(self._observers, Observers.observeProperty(part, "Size", function(size)
+		self.size = (size :: Vector3)
+		return
+	end))
+
+	table.insert(self._observers, Observers.observeProperty(part, "Parent", function(parent)
+		self.inWorld = parent ~= nil
+		return
+	end))
+
+	--a runtime CollisionGroup change used to be invisible to historical queries, which kept
+	--filtering against whatever the group was when the first hitbox record was built, while the
+	--live workspace query saw the current one. The two halves of a merged result disagreed.
+	table.insert(self._observers, Observers.observeProperty(part, "CollisionGroup", function(group)
+		self.collisionGroup = (group :: string)
+		return
+	end))
+
+	table.insert(self._observers, Observers.observeProperty(part, "CanCollide", function(canCollide)
+		self.canCollide = (canCollide :: boolean)
+		return
+	end))
+
+	return self
 end
 
-function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: PartRegister) -> ())?): PartRegister
-    local self: PartRegister
+--only drives the deferred destroy now; the history structure reads state directly
+function PartRegister.Step(self: PartRegister)
+	if self._isDestroyed or not self._pendingDestroy then
+		return
+	end
 
-    if #partCache > 0 then
-        self = table.remove(partCache) :: PartRegister
-        
-        self.index = 0
-        self._isDestroyed = false
-        self._pendingDestroy = false
-        self._destroyTargetIndex = -1
-        self.callback = callback :: any
-        
-        for i = 1, frameCap do
-            local fd = self.frameData[i]
-            fd.cframe = false
-            fd.size = part.Size
-            fd.canCollide = part.CanCollide
-        end
-    else
-        local defaultData: PartData = {
-            cframe = false,
-            size = part.Size,
-            canCollide = part.CanCollide,
-        }
+	self._destroyCountdown -= 1
+	if self._destroyCountdown > 0 then
+		return
+	end
 
-        local config = {
-            initialIndex = 0,
-            frameCap = frameCap,
-            defaultData = defaultData,
-            callback = callback :: any,
-            SaveData = SaveData :: any,
-        } :: FrameRegister.Config<PartData>
+	task.defer(function()
+		if self._pendingDestroy and not self._isDestroyed then
+			self:Destroy()
+		end
+	end)
+end
 
-        self = setmetatable(FrameRegister.new(config), PartRegister) :: any & PartRegister
-        self.SaveData = SaveData :: any 
-    end
+--an untagged part keeps its history for one full window before it is dropped
+function PartRegister.ScheduleDestroy(self: PartRegister)
+	if self._isDestroyed or self._pendingDestroy then
+		return
+	end
 
-    self.part = part
-    self._currentSize = part.Size
-    self._inWorld = part.Parent ~= nil
+	self._pendingDestroy = true
+	self._destroyCountdown = self.frameCap
+end
 
-    local owner = part:GetAttribute(Settings.OWNER_ATTRIBUTE)
-    self.owner = if typeof(owner) == "string" then owner else "Server"
+function PartRegister.UnscheduleDestroy(self: PartRegister)
+	if self._isDestroyed or not self._pendingDestroy then
+		return
+	end
 
-    self._observers = self._observers or {}
-    
-    table.insert(self._observers, Observers.observeProperty(part, "Size", function(size)
-        self._currentSize = (size :: Vector3)
-        return
-    end))
-
-    table.insert(self._observers, Observers.observeProperty(part, "Parent", function(parent)
-        self._inWorld = parent ~= nil
-        return
-    end))
-
-    return self
+	self._pendingDestroy = false
+	self._destroyCountdown = 0
 end
 
 function PartRegister.Destroy(self: PartRegister)
-    if self._isDestroyed then return end
+	if self._isDestroyed then
+		return
+	end
 
-    for _, observer in self._observers do
-        observer()
-    end
-    table.clear(self._observers)
+	for _, disconnect in self._observers do
+		disconnect()
+	end
+	table.clear(self._observers)
 
-    self.part = nil :: any
-    
-    self._isDestroyed = true
-    self._pendingDestroy = false
-    
-    if self.callback then
-        self.callback(self :: any)
-    end
+	self._isDestroyed = true
+	self._pendingDestroy = false
+	self.part = nil :: any
 
-    table.insert(partCache, self)
+	if self.callback then
+		self.callback(self)
+	end
 end
 
 return PartRegister

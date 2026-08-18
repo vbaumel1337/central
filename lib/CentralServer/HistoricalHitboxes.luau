@@ -174,10 +174,11 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 	local frameHitboxes = self.hitboxes[index]
 
 	for _, info in self.partList do
-		info.register:Step()
-		local data = info.register:AtIndex(index)
+		local register = info.register
+		register:Step()
 		local hitbox = frameHitboxes[info.id]
-		if not data.cframe then
+
+		if not register.inWorld then
 			if hitbox then
 				tree:remove(info.id)
 				frameHitboxes[info.id] = nil
@@ -185,29 +186,34 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 			continue
 		end
 
+		--CFrame is the only field still worth reading off the instance every capture
+		local cframe = register.part.CFrame
+		local size = register.size
+
 		if not hitbox then
 			local newHitbox: Hitbox = {
 				id = info.id,
-				cframe = data.cframe,
-				shape = bolt.create_box(data.size),
-				size = data.size,
+				cframe = cframe,
+				shape = bolt.create_box(size),
+				size = size,
 				instance = info.part,
-				owner = info.register.owner,
-				collisionGroup = info.part.CollisionGroup,
-				canCollide = data.canCollide,
+				owner = register.owner,
+				collisionGroup = register.collisionGroup,
+				canCollide = register.canCollide,
 				frameOffset = 0,
 				active = true,
 			}
 			frameHitboxes[info.id] = newHitbox
 			tree:insert(info.id, newHitbox.cframe, newHitbox.shape)
 		else
-			if data.size ~= hitbox.size then
-				hitbox.size = data.size
-				hitbox.shape = bolt.create_box(data.size)
+			if size ~= hitbox.size then
+				hitbox.size = size
+				hitbox.shape = bolt.create_box(size)
 				tree:resize(info.id, hitbox.shape)
 			end
-			hitbox.cframe = data.cframe
-			hitbox.canCollide = data.canCollide
+			hitbox.cframe = cframe
+			hitbox.canCollide = register.canCollide
+			hitbox.collisionGroup = register.collisionGroup
 			tree:move(info.id, hitbox.cframe)
 		end
 	end

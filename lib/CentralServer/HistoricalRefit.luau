@@ -426,13 +426,13 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 	local count = self.slotCount[index]
 
 	for _, info in self.partList do
-		info.register:Step()
-		local data = info.register:AtIndex(index)
+		local register = info.register
+		register:Step()
 		local id = info.id
 		local node = leafMap[id]
 		local hitbox = frameHitboxes[id]
 
-		if not data.cframe then
+		if not register.inWorld then
 			if hitbox then
 				frameHitboxes[id] = nil
 				count -= 1
@@ -442,17 +442,21 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 			continue
 		end
 
+		--CFrame is the only field still worth reading off the instance every capture
+		local cframe = register.part.CFrame
+		local size = register.size
+
 		local current: Hitbox
 		if not hitbox then
 			current = {
 				id = id,
-				cframe = data.cframe,
-				shape = bolt.create_box(data.size),
-				size = data.size,
+				cframe = cframe,
+				shape = bolt.create_box(size),
+				size = size,
 				instance = info.part,
-				owner = info.register.owner,
-				collisionGroup = info.part.CollisionGroup,
-				canCollide = data.canCollide,
+				owner = register.owner,
+				collisionGroup = register.collisionGroup,
+				canCollide = register.canCollide,
 				frameOffset = 0,
 				active = true,
 			}
@@ -460,12 +464,13 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 			count += 1
 		else
 			current = hitbox
-			if data.size ~= current.size then
-				current.size = data.size
-				current.shape = bolt.create_box(data.size)
+			if size ~= current.size then
+				current.size = size
+				current.shape = bolt.create_box(size)
 			end
-			current.cframe = data.cframe
-			current.canCollide = data.canCollide
+			current.cframe = cframe
+			current.canCollide = register.canCollide
+			current.collisionGroup = register.collisionGroup
 		end
 
 		local boxMin, boxMax = boxAABB(current.cframe, current.shape.half_extents)
