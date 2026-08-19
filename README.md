@@ -442,14 +442,14 @@ table used to be measured, before `HISTORY_CAPTURE_DIVISOR` existed):
 
 | hitboxes | 0 | 1 | 5 | 10 | 25 | 50 | 100 |
 |---|---|---|---|---|---|---|---|
-| 50 | 0.07% | 0.08% | 0.10% | 0.13% | 0.17% | 0.31% | 0.50% |
-| 100 | 0.13% | 0.17% | 0.15% | 0.18% | 0.28% | 0.36% | 0.73% |
-| 200 | 0.24% | 0.26% | 0.28% | 0.33% | 0.36% | 0.48% | 0.72% |
-| 400 | 0.56% | 0.52% | 0.67% | 0.68% | 0.70% | 0.80% | 1.02% |
-| 800 | 1.16% | 1.35% | 1.21% | 1.18% | 1.49% | 1.72% | 1.88% |
+| 50 | 0.07% | 0.07% | 0.09% | 0.11% | 0.17% | 0.27% | 0.49% |
+| 100 | 0.12% | 0.16% | 0.17% | 0.27% | 0.23% | 0.35% | 0.70% |
+| 200 | 0.24% | 0.29% | 0.28% | 0.29% | 0.45% | 0.46% | 0.69% |
+| 400 | 0.68% | 0.63% | 0.57% | 0.59% | 0.93% | 1.00% | 1.09% |
+| 800 | 1.31% | 1.16% | 1.22% | 1.11% | 1.43% | 1.53% | 2.02% |
 
 Sharply lower than the old table at every cell (that one topped out at 13.2%
-for 800 hitboxes/100 casts; this one tops out at 1.88%) — same caveat as
+for 800 hitboxes/100 casts; this one tops out at 2.02%) — same caveat as
 `master` above applies: this is stacking every generation of change since
 that table was measured, not something to credit to this branch alone.
 
