@@ -143,6 +143,10 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local wantOwned = ownedOnly == true
 		local invLength = fractionScale(rayDirection)
 		local rayLength = rayDirection.Magnitude
+		--the shapecast and overlap paths memo ids across the bracket to skip a repeated narrow
+		--phase. Deliberately not done here: raycast's narrow phase is bolt.raycast.box, a closed
+		--form slab test, and it is not obvious it costs more than the hash lookup that would
+		--replace it. Left until there is a measurement to decide it.
 		local originX, originY, originZ = rayOrigin.X, rayOrigin.Y, rayOrigin.Z
 
 		local centerHitboxes = self.hitboxes[centerIndex]
@@ -246,6 +250,17 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local castOrigin = cframe.Position
 		local originX, originY, originZ = castOrigin.X, castOrigin.Y, castOrigin.Z
 
+		--a hitbox that lives in several slots gets an identical pose and an identical narrow phase
+		--result from each of them, because posedCFrame is keyed on the id and the bracket, not on
+		--the slot being traversed. The traversals still each earn their keep for *candidacy* - a
+		--slot's own bounds can surface a hitbox another slot's missed - so they all still run; only
+		--the repeated pose and narrow phase are dropped.
+		--
+		--the one exception is an id the centre slot does not hold, where posedCFrame falls back to
+		--the traversed slot's own cframe and so genuinely does differ per slot. Those are never
+		--memoed.
+		local tested: {[number]: boolean} = {}
+
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
 
@@ -271,7 +286,15 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 					return nil
 				end
 
+				if tested[id] then
+					return nil
+				end
+
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				if centerHitboxes[id] ~= nil then
+					tested[id] = true
+				end
+
 				--same bound as the raycast path, widened by how far the cast shape itself reaches
 				local pp = posed.Position
 				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
@@ -343,6 +366,17 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local castOrigin = cframe.Position
 		local originX, originY, originZ = castOrigin.X, castOrigin.Y, castOrigin.Z
 
+		--a hitbox that lives in several slots gets an identical pose and an identical narrow phase
+		--result from each of them, because posedCFrame is keyed on the id and the bracket, not on
+		--the slot being traversed. The traversals still each earn their keep for *candidacy* - a
+		--slot's own bounds can surface a hitbox another slot's missed - so they all still run; only
+		--the repeated pose and narrow phase are dropped.
+		--
+		--the one exception is an id the centre slot does not hold, where posedCFrame falls back to
+		--the traversed slot's own cframe and so genuinely does differ per slot. Those are never
+		--memoed.
+		local tested: {[number]: boolean} = {}
+
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
 
@@ -366,7 +400,15 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 					return nil
 				end
 
+				if tested[id] then
+					return nil
+				end
+
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				if centerHitboxes[id] ~= nil then
+					tested[id] = true
+				end
+
 				--same bound as the raycast path, widened by how far the cast shape itself reaches
 				local pp = posed.Position
 				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
@@ -433,6 +475,17 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
 
+		--a hitbox that lives in several slots gets an identical pose and an identical narrow phase
+		--result from each of them, because posedCFrame is keyed on the id and the bracket, not on
+		--the slot being traversed. The traversals still each earn their keep for *candidacy* - a
+		--slot's own bounds can surface a hitbox another slot's missed - so they all still run; only
+		--the repeated pose and narrow phase are dropped.
+		--
+		--the one exception is an id the centre slot does not hold, where posedCFrame falls back to
+		--the traversed slot's own cframe and so genuinely does differ per slot. Those are never
+		--memoed.
+		local tested: {[number]: boolean} = {}
+
 		local function queryFrame(index: number, offset: number)
 			local tree = bindSlot(self, index)
 			if not tree then
@@ -446,7 +499,15 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 					continue
 				end
 
+				if tested[id] then
+					continue
+				end
+
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				if centerHitboxes[id] ~= nil then
+					tested[id] = true
+				end
+
 				if not collides(hitbox, posed, cframe, shape) then
 					continue
 				end
