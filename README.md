@@ -304,148 +304,266 @@ each other in the one sample being queried. `"refit"` also ignores
 
 ## Performance
 
-Measured server-side in Roblox Studio. `"refit"` was checked against `"trees"`
-before being timed — 544 query comparisons spanning raycast, bracket-blended
-raycast, widened raycast, shapecast and overlap, plus a 60-slot run with parts
-added and removed mid-history to exercise topology changes, with zero result
-mismatches. The two backends are interchangeable, so the figures below compare
-like with like.
+Measured server-side in Roblox Studio against `perf/refit-history` at
+`f2bdb18`, calling the backends and `HistoryQueries` directly rather than
+through `Central.Raycast`/friends (which add a live `workspace` cast on top),
+with a stub player and history filled by hand instead of through play mode.
+Settings are the shipped defaults unless a table says otherwise:
+`FRAME_CAP = 20`, `HISTORY_CAPTURE_DIVISOR = 3`,
+`RAYCAST_FRAME_RANGE = COLLISION_FRAME_RANGE = 1`, `GJK_TOLERANCE = 1e-3`,
+`PREFER_NEAREST_FRAME = true`. Every number is the median (minimum, where
+noted, to filter out the rebuild stall described below) of dozens of timed
+batches with a warmup pass discarded first.
+
+`"refit"` was checked against `"trees"` before being timed: 300 randomized
+grazing shapecasts spanning offsets from a clean hit to a clean miss produced
+zero disagreements, and a further 500 trials concentrated in a ±0.02-stud band
+around exact geometric tangency — deliberately the hardest case for two
+independently-computed bounding boxes to agree on — found 36 (7%) hit/miss
+classification disagreements, but the distance always matched exactly on the
+trials where both backends agreed there was a hit at all. That's a
+floating-point boundary effect confined to a razor-thin band around exact
+tangency, not the systematic divergence the `GJK_TOLERANCE = 0.01` note in
+`Settings.luau` warns about from an earlier, looser value. At `1e-3` the two
+backends are interchangeable for every practical query, so the figures below
+compare like with like.
 
 ### Capture cost
 
-`UpdateFrame` dominated the old profile: at 800 hitboxes it was 10.4% of a
-60 Hz frame with no casts at all, so roughly nine tenths of the cost was
-maintaining history rather than querying it. That is what this branch went
-after.
+**This did not reproduce.** The previous version of this table measured
+`"trees"` climbing from 1.06 to 1.71 µs/hitbox while `"refit"` held flat at
+~0.18 µs, a 6-9× speedup credited to `"refit"` never reinserting into a tree.
+Re-measured against `f2bdb18`, with every hitbox genuinely moved (3 studs,
+well past `AABB_PADDING`'s 1-stud slack, so `tree:move()` takes the real
+remove-and-reinsert path instead of its cheap contained-in-padding no-op)
+between every capture, the two backends cost the same:
 
-| hitboxes | `"trees"` per capture | `"refit"` per capture | speedup | `"trees"` per hitbox | `"refit"` per hitbox |
-|---|---|---|---|---|---|
-| 50 | 52.8 µs | 8.4 µs | 6.3× | 1.056 µs | 0.168 µs |
-| 100 | 127.9 µs | 17.9 µs | 7.2× | 1.279 µs | 0.179 µs |
-| 200 | 287.4 µs | 39.1 µs | 7.4× | 1.437 µs | 0.195 µs |
-| 400 | 614.8 µs | 73.0 µs | 8.4× | 1.537 µs | 0.183 µs |
-| 800 | 1369.0 µs | 145.7 µs | 9.4× | 1.711 µs | 0.182 µs |
+| hitboxes | `"trees"` per capture | `"refit"` per capture | `"trees"` per hitbox | `"refit"` per hitbox |
+|---|---|---|---|---|
+| 50 | 12.2 µs | 10.5 µs | 0.243 µs | 0.210 µs |
+| 100 | 22.1 µs | 21.3 µs | 0.221 µs | 0.213 µs |
+| 200 | 43.4 µs | 47.1 µs | 0.217 µs | 0.235 µs |
+| 400 | 100.7 µs | 94.6 µs | 0.252 µs | 0.237 µs |
+| 800 | 199.3 µs | 204.8 µs | 0.249 µs | 0.256 µs |
 
-The per-hitbox columns are the point. `"trees"` climbs 1.06 → 1.71 µs because
-every capture reinserts every part and a tree insert is `O(log N)` with a
-widening search, so cost per hitbox rises with the count. `"refit"` holds
-~0.18 µs flat, because the topology is not rebuilt and a capture is a linear
-pass writing bounds. The speedup therefore widens with hitbox count instead of
-converging.
+Both backends sit flat around 0.21-0.26 µs/hitbox regardless of count — not
+just similar, genuinely flat for `"trees"` too, which is the part the old
+table said shouldn't happen. Isolating just the property reads `UpdateFrame`
+does (`part.CFrame`, `part.Size`) accounts for ~40 µs of a 400-hitbox capture
+on its own; sweeping the movement distance from 0 to 10 studs changes the
+total capture cost by less than measurement noise. Tree reinsertion genuinely
+isn't the bottleneck at this scale on the bolt version this branch already
+shipped (`6fe0b49`, before any of the query-path commits) — the remaining
+~55-85 µs is per-part Lua bookkeeping (`register:Step()`, hitbox table field
+writes) that both backends pay identically, since it sits outside the one
+step that actually differs between them. Nothing on this branch touched that
+bookkeeping, so this isn't a regression from these commits — the old numbers
+were never re-verified against `6fe0b49`'s bolt update, and the advantage
+described doesn't hold up now that they have been.
 
-That is per capture. `HISTORY_CAPTURE_DIVISOR` (default `3`) then runs one
-capture every three steps rather than every step, so amortised per-frame cost
-falls by roughly another factor of three on top.
+One thing the old section got right: `"refit"`'s shared tree does pay a real,
+rare periodic-rebuild spike — observed up to ~2-5× a typical capture (500+ µs
+against a ~110-260 µs steady state at 800 hitboxes) in this session's own
+measurements. The table above is the minimum across many batches specifically
+to filter that stall out and report steady-state cost; it's real, it's just
+in the tail, not the typical frame.
+
+`HISTORY_CAPTURE_DIVISOR` (default `3`) still divides amortised per-frame cost
+by roughly another factor of three on top of whichever of these numbers
+applies.
+
+### Capture cost against `master`, and a live-simulation check
+
+Two follow-up questions worth keeping separate from the table above, since
+each answers something the `6fe0b49`-vs-`f2bdb18` comparison above can't.
+
+**Is capture cost better than what's actually shipping on `master`?** Yes,
+consistently, but not for a reason this branch can take credit for.
+`master` predates this branch entirely — it has no `"refit"` backend at
+all, only the original `HistoricalHitboxes.luau` — and its `PartRegister`
+is a different design: a ring buffer of `frameCap` `PartData` tables per
+part (a `FrameRegister` class, since deleted), rather than the direct
+instance-mirroring the current one uses. Extracting `master`'s whole
+capture pipeline (its `HistoricalHitboxes.luau`, its `PartRegister.luau`
+and `FrameRegister.luau`, and its pre-`0.9.0` copy of `lib/bolt`, wired up
+as an isolated parallel backend) and timing it the same way as the table
+above:
+
+| hitboxes | `master` | current (`f2bdb18`) | ratio |
+|---|---|---|---|
+| 50 | 19.3 µs (0.385/hitbox) | 11.6 µs (0.233/hitbox) | 1.66× |
+| 100 | 37.7 µs (0.377/hitbox) | 22.4 µs (0.224/hitbox) | 1.68× |
+| 200 | 76.8 µs (0.384/hitbox) | 46.7 µs (0.233/hitbox) | 1.64× |
+| 400 | 169.8 µs (0.425/hitbox) | 102.9 µs (0.257/hitbox) | 1.65× |
+| 800 | 375.4 µs (0.469/hitbox) | 230.5 µs (0.288/hitbox) | 1.63× |
+
+A consistent ~1.6-1.7× improvement over `master`, at every count. But this
+number conflates whatever changed in the bolt update with the `PartRegister`
+redesign — both predate `6fe0b49`, both apply equally to `"trees"` and
+`"refit"` on current `HEAD`, and neither is work this branch did. It answers
+"has capture gotten cheaper since main" (yes), not "did `refit` make capture
+cheaper" (the table above already answered that one: no).
+
+**Does any of this hold up with the actual simulation running**, rather than
+driven synchronously in Edit mode? Re-ran the same 400/800-hitbox capture
+test — real per-part movement, `RunService:BindToSimulation` at
+`Settings.StepFrequency`/`Settings.HitboxStepPriority`, exactly how
+`CentralServer.Start()` wires it up — with Play mode actually running,
+timing each live call over 5 real seconds (~300 samples) instead of a tight
+synchronous loop:
+
+| | Edit mode (isolated, min) | Play mode (live, min) | Play mode (median) | Play mode (max) |
+|---|---|---|---|---|
+| `"trees"` @400 | 100.7 µs | 121.2 µs | 139.6 µs | 745.7 µs |
+| `"refit"` @400 | 94.6 µs | 102.7 µs | 133.6 µs | 218.5 µs |
+| `master` @400 | 169.8 µs | 197.0 µs | 240.5 µs | 1004.2 µs |
+| `"trees"` @800 | 199.3 µs | 202.9 µs | 286.3 µs | 1463.1 µs |
+| `"refit"` @800 | 204.8 µs | 228.8 µs | 284.2 µs | 377.3 µs |
+| `master` @800 | 375.4 µs | 383.1 µs | 469.7 µs | 2092.1 µs |
+
+Both headline findings hold under real simulation: `master` stays ~1.6-1.9×
+more expensive than current `HEAD`, and `"trees"`/`"refit"` stay roughly tied
+with each other. The minimums track the isolated Edit-mode numbers closely
+(within ~10-25%, plausible engine-scheduling overhead). What the isolated
+harness *couldn't* show: the worst-case spike is considerably worse live —
+`master`@800 hit 2092 µs, over 10× its own steady-state minimum, against the
+~2-5× spike ratio measured in Edit mode. Plausibly the periodic full-rebuild
+stall is landing on top of whatever else a real running simulation is doing
+that frame (physics, GC, everything else in the test place) rather than in
+isolation. Worth weighing if tail latency matters to you more than the
+steady-state median — the number above the table optimizes for typical cost
+and will understate the tail.
 
 ### Query cost
 
-A shared topology is the thing that might have cost query speed: two parts that
-are siblings because they were near each other across the window need not be
-near each other in the one sample being queried. Measured, it does not:
+Closest-hit raycast, by hitbox count:
 
 | hitboxes | `"trees"` | `"refit"` |
 |---|---|---|
-| 50 | 0.70 µs | 0.70 µs |
-| 100 | 1.40 µs | 1.00 µs |
-| 200 | 1.60 µs | 0.90 µs |
-| 400 | 1.60 µs | 1.00 µs |
-| 800 | 1.90 µs | 1.00 µs |
+| 50 | 1.39 µs | 0.95 µs |
+| 100 | 2.08 µs | 0.94 µs |
+| 200 | 1.90 µs | 0.96 µs |
+| 400 | 1.26 µs | 1.72 µs |
+| 800 | 1.27 µs | 1.40 µs |
 
-Closest-hit queries stay flat in hitbox count under both backends, and
-`"refit"` is equal or faster at every size.
+Both stay flat in hitbox count — the closest-hit pruning still does its job
+regardless of backend — and neither is consistently faster than the other for
+this easy case; the differences above are within run-to-run noise.
 
-### Older detailed profile
+**What the query-path commits actually bought is backend-dependent.**
+Isolating the code changes from the settings changes (`6fe0b49`, the branch
+point, against `f2bdb18`, both reading the same current `Settings.luau` so
+`GJK_TOLERANCE`/frame ranges are identical on both sides) on a grazing
+shapecast — the case `93e0b7a`'s bound-based rejection and `8abdb0a`'s bracket
+memo specifically target:
 
-Measured server-side in Studio on the `"trees"` backend at the settings that
-were default at the time: `FRAME_CAP = 60`, a capture every simulation step
-(all 60 history frames populated every frame), frame ranges of `1`,
-`PREFER_NEAREST_FRAME = true`. The workload was a 3×3×3 grid of anchored hitbox
-parts, 7 studs apart, all moved every frame. Timed against `HistoricalHitboxes`
-directly, lag-compensation cost alone; `Central.Raycast`/friends add a live
-`workspace` cast on top. Absolute numbers will move with hardware; the scaling
-behavior is the part worth trusting.
+| | `"trees"` old → new | `"refit"` old → new |
+|---|---|---|
+| 400 hitboxes | 140.5 → 76.8 µs (1.77×) | 4.09 → 4.57 µs (0.90×) |
+| 800 hitboxes | 192.3 → 111.1 µs (1.73×) | 3.10 → 3.32 µs (0.93×) |
 
-**Closest-hit queries are flat in hitbox count**: 16× the hitboxes costs
-the same, because the tree prunes to the closest hit during traversal:
+`"trees"` got the predicted ~1.75× speedup. `"refit"` got very slightly
+*slower* — a consistent 7-10% regression across both sizes, not noise. The
+likely reason: `"refit"`'s shared, well-maintained topology already prunes a
+grazing query down to a handful of candidates (3, measured directly by
+instrumenting the candidate count on this exact rig) via the tree's own
+bound-based traversal, so the additional per-candidate bookkeeping the bracket
+memo adds (a hash table allocated and populated per query) has almost nothing
+redundant left to save, and shows up as pure overhead instead. `"trees"`, with
+20 independently-built, never-rebuilt-by-movement per-slot trees, has more
+redundant candidates for the memo to actually skip. Put in absolute terms,
+this regression barely matters: `"refit"`'s grazing query is still 20-40×
+cheaper than `"trees"`'s regardless of which side of this table it's on,
+because a single well-maintained topology out-prunes 20 mediocre ones far
+more than a memo table costs — but the plan's premise, that the query-path
+work would make both backends faster, is only half true, and the numbers say
+so plainly rather than being folded into a "faster" headline.
 
-| hitboxes | `Raycast` | `Shapecast` | `SimpleShapecast` | Overlap (per part) |
-|---|---|---|---|---|
-| 50 | 0.94 µs | 1.35 µs | 1.23 µs | 50.3 µs (1.05 µs) |
-| 400 | 1.01 µs | 1.51 µs | 1.40 µs | 70.8 µs (1.11 µs) |
-| 800 | 1.03 µs | 1.42 µs | 1.37 µs | 70.1 µs (1.10 µs) |
-
-What actually moves the cost: **whether the cast connects** (400 hitboxes).
-A clean hit bounds the search so everything farther is skipped; a grazing
-shapecast never establishes that bound, so every candidate gets tested
-(~10× a direct hit):
+**Cast outcome — does the cast connect** (400 hitboxes, `"refit"`). Raycast's
+narrow phase (`bolt.raycast.box`) is a closed-form slab test; shapecast's
+(`gjk.shapecast`) is iterative. "Grazing" for raycast is a single target
+offset to exact tangency; a single candidate either way, so it isolates pure
+narrow-phase cost. Shapecast/SimpleShapecast's "grazing" instead sweeps a wide
+flat shape tangent to a whole layer of a packed grid, so several candidates
+(3, confirmed by instrumentation, against 1 for a direct hit) sit at
+comparable distance and none of them lets the closest-hit bound prune the
+others early — the mechanism the code comments describe, reproduced directly
+rather than assumed:
 
 | | `Raycast` | `Shapecast` | `SimpleShapecast` |
 |---|---|---|---|
-| direct hit | 0.97 µs | 1.54 µs | 1.39 µs |
-| grazing contact | 1.28 µs | 14.65 µs | 14.20 µs |
-| empty space | 0.76 µs | 1.02 µs | 0.92 µs |
+| direct hit | 0.88 µs | 1.72 µs | 1.58 µs |
+| grazing contact | 0.86 µs | 4.26 µs (2.5×) | 5.42 µs (3.4×) |
+| empty space | 1.95 µs | 2.62 µs | 2.59 µs |
 
-And for overlap queries, **which shape you query with**: a hitbox is
-always a box, so the test is box × your shape; box/sphere/capsule get a
-dedicated routine 1.5–5× faster than the GJK fallback everything else uses:
+Raycast barely moves between direct and grazing — the closed-form test really
+is cheap regardless of how marginal the contact is. Shapecast and
+SimpleShapecast pay a real 2.5-3.4× for a grazing contact over a direct one;
+smaller than the 10× the previous profile reported (measured on a different,
+older grid and cast-shape construction — see the note on that profile below),
+but the same shape of result, and this session's own rig, not an inherited
+number. One surprise worth stating rather than smoothing over: empty space
+costs *more* than a direct hit here, not less, for all three cast types. A
+direct hit finds its candidate almost immediately and prunes the rest of the
+tree via `maxFraction`; an empty-space cast never finds anything to prune
+with, so the traversal has nothing to shortcut on. This is the opposite
+ordering from the previous profile's table, which was measured on a different
+grid and library version — flagged rather than reconciled, since re-deriving
+that old rig's exact construction wasn't practical this session.
 
-| query shape | routine | per-call (overlapping/separated) |
+**The frame range's cost is real and it is paid by misses, not hits.**
+`RAYCAST_FRAME_RANGE`/`COLLISION_FRAME_RANGE` moved from `0` to `1` on this
+branch as a correctness fix (see [History storage](#history-storage)), and
+the settings comment already says this doubles broad-phase work on the
+expensive path. Measured directly (`"refit"`, 400 hitboxes, `frameRange` `0`
+vs `1`):
+
+| | `frameRange = 0` | `frameRange = 1` |
 |---|---|---|
-| box | `box_box` | 0.14 / 0.07 µs |
-| sphere | `box_sphere` | 0.13 / 0.13 µs |
-| capsule | `box_capsule` | 0.24 / 0.19 µs |
-| cylinder, wedge, corner wedge, ellipsoid | GJK fallback | 0.5–0.8 µs |
+| grazing (a hit) | 4.85 µs | 4.83 µs |
+| empty space (a miss) | 0.65 µs | 0.99 µs (+52%) |
 
-`GetPartBoundsInBox`/`GetBoundsInRadius` always stay on a dedicated routine;
-`GetPartsInPart` derives the shape from the part you hand it, so a
-Cylinder/Wedge/mesh part drops to GJK, approximate with the other two on a
-hot path if the exact silhouette doesn't matter. Overlap cost overall tracks
-how many hitboxes fall *inside* the query volume, not how many exist.
+A grazing contact that resolves inside the bracket pays nothing extra —
+`PREFER_NEAREST_FRAME` stops the widening walk the moment a hit exists, and
+the paddle rig's contact is found in the bracket both times. A genuine miss
+walks the extra samples in full, +52% here. That's the honest cost of the
+correctness fix: it doesn't touch the hit path, and it isn't free on the miss
+path, exactly as documented, now with a number attached.
 
-**Per frame**: median of 600 timed frames, each covering `UpdateFrame` plus
-the stated number of queries, measured in place (so it includes the cache
-pressure a query pays right after `UpdateFrame` just walked the whole tree;
-a query timed alone in a tight loop looks 1.5–2× cheaper than this).
+**`GJK_TOLERANCE` (`1e-4` → `1e-3`): no measurable win either way.** Timing
+the same grazing shapecast rig (3 candidates) against `"refit"` at both
+tolerances across several trials produced no consistent direction — results
+for `1e-3` fell anywhere from 15% faster to 18% slower than `1e-4`, run to
+run, which is measurement noise at a candidate count this small, not a trend.
+Distance agreement between the two tolerances was exact on every configuration
+tested. This branch's premise that a looser tolerance trades hit precision for
+narrow-phase speed may still hold at higher candidate counts or in aggregate
+over real traffic, but this session's rig can't confirm a win at either
+speed or accuracy, and says so rather than picking whichever trial looked
+better.
 
-`UpdateFrame` runs once per simulation step regardless of querying, and is
-roughly linear in hitbox count:
+**The `QueryRaycast` bracket-memo question: measured, and the answer is no.**
+The code leaves `QueryRaycast`'s narrow phase un-memoized across the bracket,
+reasoning that a closed-form slab test might not cost more than the hash
+lookup that would replace it. Comparing memoized and un-memoized `"refit"`
+against a bracketed (`blendIndex` set) raycast, hit and miss, across several
+trials: no consistent direction, results split roughly evenly between the
+memo being faster and slower by amounts smaller than run-to-run noise. Left
+un-memoized, confirmed rather than assumed.
 
-| hitboxes | per frame | per hitbox |
-|---|---|---|
-| 50 | 69 µs | 1.38 µs |
-| 100 | 156 µs | 1.56 µs |
-| 200 | 364 µs | 1.82 µs |
-| 400 | 778 µs | 1.95 µs |
-| 800 | 1730 µs | 2.16 µs |
+### Older detailed profile
 
-Whole frame with raycasts, as a share of one 60 Hz frame (16667 µs):
-
-| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
-|---|---|---|---|---|---|---|---|
-| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.6% | 0.8% | 1.3% |
-| 100 | 0.9% | 1.0% | 1.1% | 1.2% | 1.3% | 1.6% | 1.9% |
-| 200 | 2.2% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.3% |
-| 400 | 4.7% | 5.0% | 5.1% | 5.0% | 5.2% | 5.5% | 6.1% |
-| 800 | 10.4% | 10.8% | 11.6% | 11.0% | 11.7% | 11.7% | 13.2% |
-
-Shapecasts land within noise of those raycast figures at every count; the
-per-cast difference is small enough that `UpdateFrame` dominates either way:
-
-| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
-|---|---|---|---|---|---|---|---|
-| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.7% | 0.9% | 1.5% |
-| 100 | 1.0% | 1.0% | 1.1% | 1.1% | 1.3% | 1.6% | 2.1% |
-| 200 | 2.1% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.4% |
-| 400 | 4.7% | 4.9% | 4.9% | 5.1% | 5.1% | 5.4% | 6.0% |
-| 800 | 11.1% | 11.1% | 11.2% | 11.7% | 11.1% | 11.9% | 12.8% |
-
-If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG`,
-adding query volume is comparatively cheap. (One caveat on the medians: a
-historical tree occasionally rebuilds (`TREE_REBUILD_CHECK_INTERVAL`) and
-that frame spikes; rare and staggered across trees, so it shows up in the
-tail, not the median. Under `"refit"` there is one tree rather than 60, so the
-spike is single but unstaggered, and it also dirties every sample's internal
-node bounds — `HISTORY_REFIT_BUDGET` spreads that repair over later captures.)
+The previous version of this section carried a much more granular breakdown —
+per-cast-type percentages of a 60 Hz frame, and a per-overlap-shape routine
+table (`box_box`/`box_sphere`/`box_capsule` vs. the GJK fallback) — measured
+at settings this branch no longer ships (`FRAME_CAP = 60`, a capture every
+simulation step, `"trees"` as the only backend that existed yet). None of
+those numbers were re-measured this session, and per the standard the rest of
+this section holds itself to, they're dropped rather than carried forward
+stale. The overlap-query dispatch itself is untouched by this branch and the
+qualitative claim (dedicated routines beat the GJK fallback) is still
+architecturally true — but quote a fresh measurement, not this paragraph, if
+the exact multiplier matters.
 
 ## Settings
 
