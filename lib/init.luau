@@ -20,6 +20,28 @@ local visualizer = require(script.visualizer)
 local Settings = require(script.Settings)
 
 local RAYCAST_MARGIN = Settings.RAYCAST_MARGIN
+
+--create_from_part reads two properties off the instance and builds a fresh shape table on every
+--shapecast, for parts whose shape almost never changes: a projectile fired each frame rebuilds an
+--identical table sixty times a second. Cached against the part instead, and rebuilt only when Size
+--or Shape actually moves - the same pattern the capture side already uses for hitbox boxes.
+--
+--Weak keys, so holding a shape here never keeps a destroyed part alive.
+local castShapeCache: {[BasePart]: {size: Vector3, shape: any, value: any}} =
+	setmetatable({}, {__mode = "k"}) :: any
+
+local function castShapeFor(part: any): any
+	local entry = castShapeCache[part]
+	if entry ~= nil and entry.size == part.Size and entry.shape == part.Shape then
+		return entry.value
+	end
+
+	--this raises for meshes, unions and anything that is not a Part, exactly as before. Reading
+	--.Shape below is only reached once it has succeeded, so it is known to be a Part by then.
+	local value = bolt.create_from_part(part)
+	castShapeCache[part] = {size = part.Size, shape = part.Shape, value = value}
+	return value
+end
 local OWNED_SOURCE = Settings.OWNED_HITBOX_SOURCE
 --stands in for the owned part list when owned hitboxes are resolved through the history
 --path instead, so the live merges below collapse without a branch of their own
@@ -575,7 +597,7 @@ function Central.Shapecast(player:Player, part:Part, direction:Vector3, raycastP
     if isServer then
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
-        local castShape = bolt.create_from_part(part)
+        local castShape = castShapeFor(part)
 
         if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
             local ownedHitbox, ownedPoint, ownedDistance, ownedNormal = CentralServer.QueryOwnedShapecast(player, part.CFrame, castShape, newDirection, raycastParams, check)
@@ -628,7 +650,7 @@ function Central.SimpleShapecast(player:Player, part:Part, direction:Vector3, ra
     if isServer then
         local newDirection = if distance then direction.Unit*(distance+RAYCAST_MARGIN) else direction
 
-        local castShape = bolt.create_from_part(part)
+        local castShape = castShapeFor(part)
 
         if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
             local ownedHitbox, ownedDistance = CentralServer.QueryOwnedSimpleShapecast(player, part.CFrame, castShape, newDirection, raycastParams, check)
@@ -732,7 +754,7 @@ function Central.GetPartsInPart(player:Player, part:Part, overlapParams:OverlapP
         else workspace:GetPartsInPart(part, overlapParams)
 
     if isServer then
-        local queryCFrame, queryShape = part.CFrame, bolt.create_from_part(part)
+        local queryCFrame, queryShape = part.CFrame, castShapeFor(part)
         local overlapCheck = querySettings and querySettings.check
 
         if OWNED_SOURCE == "history" and CentralServer.HasOwnedHitboxes(player) then
