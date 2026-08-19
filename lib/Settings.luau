@@ -86,7 +86,10 @@ local Settings = {
     LATENCY_MEASURE_PAUSE = 0.5, -- seconds to wait between measurements
 
     RAYCAST_MARGIN = 1e-4,
-    GJK_TOLERANCE = 1e-4,
+    --how close gjk has to get before it accepts a contact. it is a convergence threshold, not an
+    --accuracy guarantee: a looser value ends the advancement loop in fewer iterations, so it
+    --trades hit precision for narrow phase cost. Not yet measured at this value.
+    GJK_TOLERANCE = 0.01,
 
     AABB_PADDING = 1,
 }

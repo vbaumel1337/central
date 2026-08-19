@@ -132,6 +132,7 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 				cframe = cframe,
 				shape = bolt.create_box(size),
 				size = size,
+				boundingRadius = size.Magnitude / 2,
 				instance = info.part,
 				owner = register.owner,
 				collisionGroup = register.collisionGroup,
@@ -145,6 +146,7 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 			if size ~= hitbox.size then
 				hitbox.size = size
 				hitbox.shape = bolt.create_box(size)
+				hitbox.boundingRadius = size.Magnitude / 2
 				tree:resize(info.id, hitbox.shape)
 			end
 			hitbox.cframe = cframe

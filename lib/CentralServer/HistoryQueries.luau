@@ -37,6 +37,9 @@ export type Hitbox = {
 	canCollide: boolean,
 	frameOffset: number,
 	active: boolean,
+	--radius of the sphere about the box's centre that contains it, cached because the pruning
+	--bound needs it per candidate and it only changes when the part is resized
+	boundingRadius: number,
 }
 
 --all the shared traversals read off a backend. both backends are supersets of this.
@@ -61,6 +64,26 @@ local HistoryQueries = {}
 
 --the closest-hit tree queries work in fractions of the cast, not studs, so narrow phase
 --distances get scaled by this. a zero length sweep collapses every hit onto fraction 0.
+--how far a cast shape reaches from its own origin. Any shape this does not recognise returns
+--infinity, which makes the pruning bound below trivially true and so simply never fires.
+local function castBoundingRadius(shape: any): number
+	local he = shape.half_extents
+	if he ~= nil then
+		return math.sqrt(he.X * he.X + he.Y * he.Y + he.Z * he.Z)
+	end
+
+	local radius = shape.radius
+	if radius ~= nil then
+		local halfHeight = shape.half_height
+		if halfHeight ~= nil then
+			return math.sqrt(halfHeight * halfHeight + radius * radius)
+		end
+		return radius
+	end
+
+	return math.huge
+end
+
 local function fractionScale(direction: Vector3): number
 	local length = direction.Magnitude
 	return if length > 0 then 1 / length else 0
@@ -119,6 +142,8 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		--the querying player's own hitboxes are the other half of a merged result, never both
 		local wantOwned = ownedOnly == true
 		local invLength = fractionScale(rayDirection)
+		local rayLength = rayDirection.Magnitude
+		local originX, originY, originZ = rayOrigin.X, rayOrigin.Y, rayOrigin.Z
 
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
@@ -140,14 +165,23 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 			--anything the cast reaches after the current best is pruned before its narrow phase runs
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
+			tree:query_ray_closest(rayOrigin, rayDirection, function(id: number, bound: number): number?
 				local hitbox = frameHitboxes[id]
 				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 					return nil
 				end
 
 				--the slot decides candidacy, the rewind time decides the pose
+				--the ray cannot reach this box's bounding sphere before the running best, so it
+				--cannot win and never needs its narrow phase. Compared squared to avoid a root.
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				local pp = posed.Position
+				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+				local reach = hitbox.boundingRadius + bound * rayLength
+				if gx * gx + gy * gy + gz * gz > reach * reach then
+					return nil
+				end
+
 				local hitPoint, distance, hitNormal = bolt.raycast.box(rayOrigin, rayDirection, posed, hitbox.shape)
 				if distance == nil then
 					return nil
@@ -206,6 +240,11 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		--the querying player's own hitboxes are the other half of a merged result, never both
 		local wantOwned = ownedOnly == true
 		local invLength = fractionScale(direction)
+		--the cast's own reach, resolved once: the bound below is about the gap between origins
+		local castRadius = castBoundingRadius(shape)
+		local castLength = direction.Magnitude
+		local castOrigin = cframe.Position
+		local originX, originY, originZ = castOrigin.X, castOrigin.Y, castOrigin.Z
 
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
@@ -226,13 +265,21 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 			local frameHitboxes = self.hitboxes[index]
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
+			tree:query_shapecast_closest(shape, cframe, direction, function(id: number, bound: number): number?
 				local hitbox = frameHitboxes[id]
 				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 					return nil
 				end
 
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				--same bound as the raycast path, widened by how far the cast shape itself reaches
+				local pp = posed.Position
+				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+				local reach = castRadius + hitbox.boundingRadius + bound * castLength
+				if gx * gx + gy * gy + gz * gz > reach * reach then
+					return nil
+				end
+
 				local hitPoint, distance, hitNormal = gjk.shapecast(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
 				if distance == nil then
 					return nil
@@ -290,6 +337,11 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		--the querying player's own hitboxes are the other half of a merged result, never both
 		local wantOwned = ownedOnly == true
 		local invLength = fractionScale(direction)
+		--the cast's own reach, resolved once: the bound below is about the gap between origins
+		local castRadius = castBoundingRadius(shape)
+		local castLength = direction.Magnitude
+		local castOrigin = cframe.Position
+		local originX, originY, originZ = castOrigin.X, castOrigin.Y, castOrigin.Z
 
 		local centerHitboxes = self.hitboxes[centerIndex]
 		local blendHitboxes = if blendIndex then self.hitboxes[blendIndex] else nil
@@ -308,13 +360,21 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 			local frameHitboxes = self.hitboxes[index]
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
+			tree:query_shapecast_closest(shape, cframe, direction, function(id: number, bound: number): number?
 				local hitbox = frameHitboxes[id]
 				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
 					return nil
 				end
 
 				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+				--same bound as the raycast path, widened by how far the cast shape itself reaches
+				local pp = posed.Position
+				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+				local reach = castRadius + hitbox.boundingRadius + bound * castLength
+				if gx * gx + gy * gy + gz * gz > reach * reach then
+					return nil
+				end
+
 				local hit, distance = gjk.shapecast_simple(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
 				if not hit or distance == nil then
 					return nil
