@@ -159,49 +159,58 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local bestNormal: Vector3? = nil
 		local bestOffset = 0
 
+		--the callback is built once for the whole query rather than once per traversal. The two
+		--things that vary per slot reach it through these instead of being captured, which matters
+		--now that a frame range above 0 means several traversals per query.
+		local frameHitboxes = centerHitboxes
+		local frameOffset = 0
+
+		local function testCandidate(id: number, bound: number): number?
+			local hitbox = frameHitboxes[id]
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+				return nil
+			end
+
+			--the slot decides candidacy, the rewind time decides the pose
+			--the ray cannot reach this box's bounding sphere before the running best, so it
+			--cannot win and never needs its narrow phase. Compared squared to avoid a root.
+			local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+			local pp = posed.Position
+			local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+			local reach = hitbox.boundingRadius + bound * rayLength
+			if gx * gx + gy * gy + gz * gz > reach * reach then
+				return nil
+			end
+
+			local hitPoint, distance, hitNormal = bolt.raycast.box(rayOrigin, rayDirection, posed, hitbox.shape)
+			if distance == nil then
+				return nil
+			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestCFrame = posed
+				bestPoint = hitPoint
+				bestNormal = hitNormal
+				bestOffset = frameOffset
+			end
+
+			return distance * invLength
+		end
+
 		local function queryFrame(index: number, offset: number)
 			local tree = bindSlot(self, index)
 			if not tree then
 				return
 			end
 
-			local frameHitboxes = self.hitboxes[index]
+			frameHitboxes = self.hitboxes[index]
+			frameOffset = offset
 			--anything the cast reaches after the current best is pruned before its narrow phase runs
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_ray_closest(rayOrigin, rayDirection, function(id: number, bound: number): number?
-				local hitbox = frameHitboxes[id]
-				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
-					return nil
-				end
-
-				--the slot decides candidacy, the rewind time decides the pose
-				--the ray cannot reach this box's bounding sphere before the running best, so it
-				--cannot win and never needs its narrow phase. Compared squared to avoid a root.
-				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
-				local pp = posed.Position
-				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
-				local reach = hitbox.boundingRadius + bound * rayLength
-				if gx * gx + gy * gy + gz * gz > reach * reach then
-					return nil
-				end
-
-				local hitPoint, distance, hitNormal = bolt.raycast.box(rayOrigin, rayDirection, posed, hitbox.shape)
-				if distance == nil then
-					return nil
-				end
-
-				if distance < bestDistance then
-					bestDistance = distance
-					bestHitbox = hitbox
-					bestCFrame = posed
-					bestPoint = hitPoint
-					bestNormal = hitNormal
-					bestOffset = offset
-				end
-
-				return distance * invLength
-			end, maxFraction)
+			tree:query_ray_closest(rayOrigin, rayDirection, testCandidate, maxFraction)
 
 			unbindSlot(self)
 		end
@@ -271,54 +280,63 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local bestNormal: Vector3? = nil
 		local bestOffset = 0
 
+		--the callback is built once for the whole query rather than once per traversal. The two
+		--things that vary per slot reach it through these instead of being captured, which matters
+		--now that a frame range above 0 means several traversals per query.
+		local frameHitboxes = centerHitboxes
+		local frameOffset = 0
+
+		local function testCandidate(id: number, bound: number): number?
+			local hitbox = frameHitboxes[id]
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+				return nil
+			end
+
+			if tested[id] then
+				return nil
+			end
+
+			local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+			if centerHitboxes[id] ~= nil then
+				tested[id] = true
+			end
+
+			--same bound as the raycast path, widened by how far the cast shape itself reaches
+			local pp = posed.Position
+			local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+			local reach = castRadius + hitbox.boundingRadius + bound * castLength
+			if gx * gx + gy * gy + gz * gz > reach * reach then
+				return nil
+			end
+
+			local hitPoint, distance, hitNormal = gjk.shapecast(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
+			if distance == nil then
+				return nil
+			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestCFrame = posed
+				bestPoint = hitPoint
+				bestNormal = hitNormal
+				bestOffset = frameOffset
+			end
+
+			return distance * invLength
+		end
+
 		local function queryFrame(index: number, offset: number)
 			local tree = bindSlot(self, index)
 			if not tree then
 				return
 			end
 
-			local frameHitboxes = self.hitboxes[index]
+			frameHitboxes = self.hitboxes[index]
+			frameOffset = offset
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_shapecast_closest(shape, cframe, direction, function(id: number, bound: number): number?
-				local hitbox = frameHitboxes[id]
-				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
-					return nil
-				end
-
-				if tested[id] then
-					return nil
-				end
-
-				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
-				if centerHitboxes[id] ~= nil then
-					tested[id] = true
-				end
-
-				--same bound as the raycast path, widened by how far the cast shape itself reaches
-				local pp = posed.Position
-				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
-				local reach = castRadius + hitbox.boundingRadius + bound * castLength
-				if gx * gx + gy * gy + gz * gz > reach * reach then
-					return nil
-				end
-
-				local hitPoint, distance, hitNormal = gjk.shapecast(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
-				if distance == nil then
-					return nil
-				end
-
-				if distance < bestDistance then
-					bestDistance = distance
-					bestHitbox = hitbox
-					bestCFrame = posed
-					bestPoint = hitPoint
-					bestNormal = hitNormal
-					bestOffset = offset
-				end
-
-				return distance * invLength
-			end, maxFraction)
+			tree:query_shapecast_closest(shape, cframe, direction, testCandidate, maxFraction)
 
 			unbindSlot(self)
 		end
@@ -385,52 +403,61 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 		local bestCFrame: CFrame? = nil
 		local bestOffset = 0
 
+		--the callback is built once for the whole query rather than once per traversal. The two
+		--things that vary per slot reach it through these instead of being captured, which matters
+		--now that a frame range above 0 means several traversals per query.
+		local frameHitboxes = centerHitboxes
+		local frameOffset = 0
+
+		local function testCandidate(id: number, bound: number): number?
+			local hitbox = frameHitboxes[id]
+			if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
+				return nil
+			end
+
+			if tested[id] then
+				return nil
+			end
+
+			local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
+			if centerHitboxes[id] ~= nil then
+				tested[id] = true
+			end
+
+			--same bound as the raycast path, widened by how far the cast shape itself reaches
+			local pp = posed.Position
+			local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
+			local reach = castRadius + hitbox.boundingRadius + bound * castLength
+			if gx * gx + gy * gy + gz * gz > reach * reach then
+				return nil
+			end
+
+			local hit, distance = gjk.shapecast_simple(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
+			if not hit or distance == nil then
+				return nil
+			end
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestHitbox = hitbox
+				bestCFrame = posed
+				bestOffset = frameOffset
+			end
+
+			return distance * invLength
+		end
+
 		local function queryFrame(index: number, offset: number)
 			local tree = bindSlot(self, index)
 			if not tree then
 				return
 			end
 
-			local frameHitboxes = self.hitboxes[index]
+			frameHitboxes = self.hitboxes[index]
+			frameOffset = offset
 			local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-			tree:query_shapecast_closest(shape, cframe, direction, function(id: number, bound: number): number?
-				local hitbox = frameHitboxes[id]
-				if not hitbox or (hitbox.owner == playerName) ~= wantOwned or QueryFilter.rejects(filter, hitbox) or (check and not check(hitbox.instance)) then
-					return nil
-				end
-
-				if tested[id] then
-					return nil
-				end
-
-				local posed = posedCFrame(centerHitboxes, blendHitboxes, blendAlpha, id, hitbox)
-				if centerHitboxes[id] ~= nil then
-					tested[id] = true
-				end
-
-				--same bound as the raycast path, widened by how far the cast shape itself reaches
-				local pp = posed.Position
-				local gx, gy, gz = pp.X - originX, pp.Y - originY, pp.Z - originZ
-				local reach = castRadius + hitbox.boundingRadius + bound * castLength
-				if gx * gx + gy * gy + gz * gz > reach * reach then
-					return nil
-				end
-
-				local hit, distance = gjk.shapecast_simple(cframe, direction, shape, posed, hitbox.shape, GJK_TOLERANCE)
-				if not hit or distance == nil then
-					return nil
-				end
-
-				if distance < bestDistance then
-					bestDistance = distance
-					bestHitbox = hitbox
-					bestCFrame = posed
-					bestOffset = offset
-				end
-
-				return distance * invLength
-			end, maxFraction)
+			tree:query_shapecast_closest(shape, cframe, direction, testCandidate, maxFraction)
 
 			unbindSlot(self)
 		end

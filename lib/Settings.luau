@@ -36,12 +36,21 @@ local Settings = {
     -- exact rewind time, so this exists for hitboxes that move far enough between captures that
     -- the bracket's own bounds might not contain them.
     --
-    -- Set to 1 rather than 0 because that gap is still open: the broad phase bounds each sample's
-    -- own pose, not the swept interval between samples, so a fast mover can be a candidate in
-    -- neither bracket slot and be missed at a blended pose it genuinely occupies. Widening by one
-    -- sample either side is the escape hatch until per-sample swept bounds exist, which is the
-    -- real fix. Blending made this unnecessary for *accuracy* between samples; it did not make
-    -- the broad phase see the motion.
+    -- Set to 1 rather than 0, for two reasons that are easy to conflate.
+    --
+    -- The first and the reason it cannot be 0: the rewind index is only as good as the latency
+    -- estimate behind it, and that estimate is never exact. Blending resolves a stamp to the two
+    -- samples it falls between and interpolates, which is exact only if the stamp is. When the
+    -- estimate is off, the true bracket is an adjacent pair, and at range 0 those slots are never
+    -- traversed at all - no amount of blending recovers a sample the query never looked at.
+    --
+    -- The second: the broad phase bounds each sample's own pose, not the swept interval between
+    -- samples, so a fast mover can be a candidate in neither bracket slot and be missed at a
+    -- blended pose it genuinely occupies. Per-sample swept bounds are the real fix for that one.
+    --
+    -- Blending made this unnecessary for accuracy *between* two correctly chosen samples. It did
+    -- not make the estimate that chooses them exact, and it did not make the broad phase see
+    -- motion between captures.
     --
     -- It is not free. A query that finds nothing walks every slot in range, so this doubles the
     -- broad phase work in exactly the grazing and empty-space cases that are the expensive ones.
