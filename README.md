@@ -434,6 +434,45 @@ isolation. Worth weighing if tail latency matters to you more than the
 steady-state median — the number above the table optimizes for typical cost
 and will understate the tail.
 
+**Whole-frame cost with N raycasts**, as a share of one 60 Hz frame
+(16667 µs) — `"refit"`, capture and N direct-hit raycasts timed together in
+place (same cache-locality conditions the queries below were *not* measured
+under), one capture assumed per sampled frame (matching how the equivalent
+table used to be measured, before `HISTORY_CAPTURE_DIVISOR` existed):
+
+| hitboxes | 0 | 1 | 5 | 10 | 25 | 50 | 100 |
+|---|---|---|---|---|---|---|---|
+| 50 | 0.07% | 0.08% | 0.10% | 0.13% | 0.17% | 0.31% | 0.50% |
+| 100 | 0.13% | 0.17% | 0.15% | 0.18% | 0.28% | 0.36% | 0.73% |
+| 200 | 0.24% | 0.26% | 0.28% | 0.33% | 0.36% | 0.48% | 0.72% |
+| 400 | 0.56% | 0.52% | 0.67% | 0.68% | 0.70% | 0.80% | 1.02% |
+| 800 | 1.16% | 1.35% | 1.21% | 1.18% | 1.49% | 1.72% | 1.88% |
+
+Sharply lower than the old table at every cell (that one topped out at 13.2%
+for 800 hitboxes/100 casts; this one tops out at 1.88%) — same caveat as
+`master` above applies: this is stacking every generation of change since
+that table was measured, not something to credit to this branch alone.
+
+Getting a clean version of this table took a real methodology lesson worth
+recording. An earlier pass, timing longer batches (30 iterations × 21
+batches, several seconds per cell) for supposed extra statistical stability,
+came back with 800-hitbox cells spuriously elevated 2-5× — not from a bigger
+workload, but because `os.clock()` in this environment is a wall clock, not
+this-script's own CPU time: it keeps advancing through real elapsed seconds
+regardless of what's executing. `TREE_REBUILD_CHECK_INTERVAL` is a real
+10 *seconds*, checked against that same clock. A cell whose own measurement
+loop happens to run long enough to approach that threshold has a real chance
+of a rebuild firing mid-measurement, landing inside every batch and making
+`min()` unable to filter it out — confirmed directly: an isolated 800-hitbox
+run with the longer batch parameters measured its own total wall time at
+3.8s and came back clean (no spike) purely because it stayed under 10s;
+another otherwise-identical run didn't. The table above uses shorter batches
+(15 × 9, verified at well under a second per cell, 6.2s total for the whole
+sheet) specifically to stay clear of that window. The lesson: a longer
+benchmark run isn't automatically a more stable one if the thing you're
+measuring has its own real-time-triggered periodic cost — it can manufacture
+the exact spike it was trying to average away.
+
 ### Query cost
 
 Closest-hit raycast, by hitbox count:
