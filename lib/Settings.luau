@@ -35,8 +35,19 @@ local Settings = {
     -- extra samples either side of the resolved bracket to search. The bracket is already the
     -- exact rewind time, so this exists for hitboxes that move far enough between captures that
     -- the bracket's own bounds might not contain them.
-    RAYCAST_FRAME_RANGE = 0,
-    COLLISION_FRAME_RANGE = 0,
+    --
+    -- Set to 1 rather than 0 because that gap is still open: the broad phase bounds each sample's
+    -- own pose, not the swept interval between samples, so a fast mover can be a candidate in
+    -- neither bracket slot and be missed at a blended pose it genuinely occupies. Widening by one
+    -- sample either side is the escape hatch until per-sample swept bounds exist, which is the
+    -- real fix. Blending made this unnecessary for *accuracy* between samples; it did not make
+    -- the broad phase see the motion.
+    --
+    -- It is not free. A query that finds nothing walks every slot in range, so this doubles the
+    -- broad phase work in exactly the grazing and empty-space cases that are the expensive ones.
+    -- PREFER_NEAREST_FRAME keeps the hit path cheap by stopping as soon as a hit exists.
+    RAYCAST_FRAME_RANGE = 1,
+    COLLISION_FRAME_RANGE = 1,
 
     -- how a closest-hit query picks a winner when several frames in range produce a hit
     -- true  = a hit in a frame nearer the player's estimated index wins outright, regardless of distance
