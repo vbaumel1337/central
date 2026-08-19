@@ -245,15 +245,26 @@ A longer interval only works because a rewind no longer snaps to a sample. The
 player's latency resolves to the two samples it falls between plus how far
 along it is, and the hitbox is evaluated at that blended pose. The sample
 decides which hitboxes are candidates; the rewind time decides where they were.
-That is strictly more accurate than picking a nearest frame, and it is what
-`RAYCAST_FRAME_RANGE` / `COLLISION_FRAME_RANGE` existed to compensate for, so
-both now default to `0`.
+That is strictly more accurate than picking a nearest frame, and it is most of
+what `RAYCAST_FRAME_RANGE` / `COLLISION_FRAME_RANGE` existed to compensate for.
+Both still default to `1` rather than `0`, for two reasons worth keeping apart.
 
-The one thing it costs: the broad phase still bounds each sample's own pose
-rather than the swept interval between samples, so a hitbox that moves far
-enough within one capture interval can be missed at the blended pose in
-between. Widen `frameRange`, or drop `HISTORY_CAPTURE_DIVISOR` to `1`, if you
-have hitboxes like that.
+**The rewind index is only as good as the latency estimate behind it, and that
+estimate is never exact.** Blending resolves a stamp to the two samples it
+falls between and interpolates, which is exact only if the stamp is. When the
+estimate is off, the true bracket is an adjacent pair — and at range `0` those
+samples are never traversed at all. No amount of blending recovers a sample the
+query did not look at. This is the reason the range cannot be `0`.
+
+**The broad phase bounds each sample's own pose, not the swept interval between
+samples.** A hitbox that moves far enough within one capture interval can be a
+candidate in neither bracket sample and so be missed at a blended pose it
+genuinely occupies. Storing swept bounds per sample is the real fix; widening
+the range, or dropping `HISTORY_CAPTURE_DIVISOR` to `1`, is the workaround.
+
+The range is not free: a query that finds nothing walks every sample in range,
+so it is the missing and grazing queries that pay for it, not the hits.
+`PREFER_NEAREST_FRAME` stops the widening as soon as a hit exists.
 
 ### Backends
 
@@ -275,6 +286,14 @@ broad phase is bolt's own traversal, unmodified.
 one of them with the current pose of every hitbox. This is the original
 implementation, kept as an escape hatch and as the reference `"refit"` is
 differentially tested against.
+
+Both backends answer queries with the same code. Filtering, the bracket blend,
+the narrow phase, the widening walk over samples and result assembly live once
+in `CentralServer/HistoryQueries.luau`; a backend supplies only the step that
+genuinely differs, namely how a sample's traversal gets a tree to walk —
+`"trees"` hands over that sample's own, `"refit"` points the shared one at the
+sample's bounds and puts it back afterwards. So the two cannot drift apart in
+query semantics, which is also what makes differential testing them meaningful.
 
 Only the grouping is shared across samples. The boxes a query tests are still
 each sample's exact per-part AABBs, so they are as tight as the per-sample
@@ -455,9 +474,9 @@ runtime, is the safe way to change a default.
 | `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
 | `HISTORY_BACKEND` | `"refit"` | `"refit"` keeps one shared topology with per-sample bounds refit bottom-up; capture cost stays flat per hitbox. `"trees"` keeps one AABB tree per history sample, the original implementation. Identical query semantics either way. |
 | `HISTORY_REFIT_BUDGET` | `4` | `refit` backend only. How many stale samples each capture re-refits, spreading the cost of a topology change. |
-| `RAYCAST_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Raycast`. |
-| `COLLISION_FRAME_RANGE` | `0` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
-| `PREFER_NEAREST_FRAME` | `true` | Tie-break when `frameRange` widens the search and several samples produce a hit: `true` = the sample nearer the rewind wins regardless of distance; `false` = spatially closest wins, ties to the nearer sample. No effect at the default `frameRange` of `0`. |
+| `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Raycast`. One sample either side of the resolved bracket, because the latency estimate that picks the bracket is never exact. |
+| `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. Same reason. |
+| `PREFER_NEAREST_FRAME` | `true` | Tie-break when `frameRange` widens the search and several samples produce a hit: `true` = the sample nearer the rewind wins regardless of distance; `false` = spatially closest wins, ties to the nearer sample. It also stops the widening early, which is what keeps a non-zero `frameRange` cheap on the hit path. |
 | `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on a historical AABB tree. Under `"trees"` that is per sample tree; under `"refit"` there is only one tree, and the check also refreshes the bounds it is rebuilt from. |
 | `TREE_REBUILD_CHECK_JITTER` | `0.2` | `"trees"` backend only. Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
 | `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before clamp/average; bias compensation earlier/later. |
@@ -469,7 +488,7 @@ runtime, is the safe way to change a default.
 | `LATENCY_MEASURE_TIMEOUT` | `1` | Seconds before an unconverged measurement cycle is abandoned. |
 | `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds between measurement cycles. |
 | `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a flush hitbox still registers. |
-| `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
+| `GJK_TOLERANCE` | `1e-3` | Convergence tolerance for the GJK shapecast/intersection routines. It is a stopping threshold, not an accuracy guarantee: a looser value ends the advancement loop in fewer iterations, trading hit precision for narrow phase cost. |
 | `AABB_PADDING` | `1` | Padding (studs) around each hitbox's bounding box in the AABB tree, giving queries slack before a partial rebuild is needed. Ignored by the `refit` backend, which stores exact bounds. |
 
 ## Third-party code
