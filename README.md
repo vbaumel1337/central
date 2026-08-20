@@ -119,10 +119,10 @@ change one.
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop runs. |
+| `StepFrequency` | `Hz30` | How often Central's `BindToSimulation` loop runs. |
 | `HitboxStepPriority` | `1000` | Priority Central's internal binding runs at; your own query-calling bindings need a higher number. |
 | `FRAME_CAP` | `20` | How many history samples are kept. |
-| `HISTORY_CAPTURE_DIVISOR` | `3` | Capture one history sample every N simulation steps. |
+| `HISTORY_CAPTURE_DIVISOR` | `1` | Capture one history sample every N simulation steps; `1` captures every step, a 30Hz capture rate at the default `StepFrequency`. Fractional values are supported too, and average out correctly over time rather than rounding up every period. |
 | `HISTORY_BACKEND` | `"refit"` | Shares one AABB tree topology across history samples, refitting bounds per sample. Cheapest backend at every measured hitbox count. |
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
@@ -130,39 +130,40 @@ change one.
 
 ## Performance
 
-Average server CPU cost per frame, as a % of one 60Hz frame's 16667µs budget,
-by hitbox count (rows) and casts issued that same frame (columns). Measured
-at the shipped defaults (`FRAME_CAP = 20`, `HISTORY_CAPTURE_DIVISOR = 3`,
-60Hz capture cadence, `HISTORY_BACKEND = "refit"`, `RAYCAST_FRAME_RANGE =
-COLLISION_FRAME_RANGE = 1`, `GJK_TOLERANCE = 1e-3`, `PREFER_NEAREST_FRAME =
-true`), server-side in Roblox Studio, driving `HistoricalRefit` and
-`HistoryQueries` directly (bypassing `Central.Raycast`/`Central.Shapecast`'s
-live-`workspace` pass) so the numbers isolate Central's own cost. Hitboxes
-are static 2×2×2 parts scattered through a cube; casts originate from a
-fixed point and aim at random points inside that cube, a mixed hit/graze/miss
-workload. Each cell averages 60 simulated steps (~1s). 0 hitboxes/0 casts
-isn't exactly 0% — that's the harness's own loop overhead. A cell over 100%
-means that configuration alone exceeds a single 60Hz frame's budget.
+Average server CPU cost per Central step, as a % of one `StepFrequency =
+Hz30` step's 33333µs budget, by hitbox count (rows) and casts issued that
+same step (columns). Measured at the shipped defaults (`FRAME_CAP = 20`,
+`HISTORY_CAPTURE_DIVISOR = 1` — a 30Hz capture rate — `HISTORY_BACKEND =
+"refit"`, `RAYCAST_FRAME_RANGE = COLLISION_FRAME_RANGE = 1`, `GJK_TOLERANCE =
+1e-3`, `PREFER_NEAREST_FRAME = true`), server-side in Roblox Studio, driving
+`HistoricalRefit` and `HistoryQueries` directly (bypassing
+`Central.Raycast`/`Central.Shapecast`'s live-`workspace` pass) so the numbers
+isolate Central's own cost. Hitboxes are static 2×2×2 parts scattered through
+a cube; casts originate from a fixed point and aim at random points inside
+that cube, a mixed hit/graze/miss workload. Each cell averages 60 simulated
+steps (~2s). 0 hitboxes/0 casts isn't exactly 0% — that's the harness's own
+loop overhead. A cell over 100% means that configuration alone exceeds a
+single step's budget.
 
 ### Raycast
 
-| hitboxes \ casts/frame | 0 | 1 | 10 | 100 | 1000 |
+| hitboxes \ casts/step | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.02% | 0.06% | 0.09% | 0.74% | 4.00% |
-| 10 | 0.05% | 0.13% | 0.20% | 1.00% | 8.38% |
-| 100 | 0.14% | 0.24% | 0.33% | 1.47% | 13.29% |
-| 1,000 | 0.90% | 1.04% | 1.32% | 3.42% | 24.98% |
-| 10,000 | 9.03% | 9.33% | 10.12% | 15.26% | 62.41% |
+| 0 | 0.02% | 0.04% | 0.06% | 0.40% | 1.80% |
+| 10 | 0.07% | 0.13% | 0.13% | 0.66% | 3.85% |
+| 100 | 0.23% | 0.27% | 0.32% | 0.99% | 5.38% |
+| 1,000 | 1.47% | 1.54% | 1.75% | 2.98% | 10.95% |
+| 10,000 | 14.37% | 14.64% | 15.04% | 17.31% | 38.54% |
 
 ### Shapecast
 
-| hitboxes \ casts/frame | 0 | 1 | 10 | 100 | 1000 |
+| hitboxes \ casts/step | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.02% | 0.08% | 0.11% | 0.44% | 4.85% |
-| 10 | 0.05% | 0.14% | 0.23% | 1.48% | 10.62% |
-| 100 | 0.14% | 0.26% | 0.40% | 1.64% | 14.77% |
-| 1,000 | 1.14% | 1.04% | 1.43% | 4.00% | 26.67% |
-| 10,000 | 8.53% | 8.49% | 12.59% | 15.13% | 57.89% |
+| 0 | 0.02% | 0.05% | 0.07% | 0.38% | 2.13% |
+| 10 | 0.07% | 0.11% | 0.15% | 0.64% | 5.21% |
+| 100 | 0.23% | 0.28% | 0.37% | 1.10% | 7.34% |
+| 1,000 | 1.44% | 1.60% | 1.72% | 3.13% | 13.49% |
+| 10,000 | 14.02% | 14.73% | 15.35% | 17.20% | 39.28% |
 
 ## Third-party code
 

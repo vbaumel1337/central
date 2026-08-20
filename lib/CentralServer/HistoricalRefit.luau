@@ -38,7 +38,10 @@ local PartRegister = require(script.Parent.Registers.PartRegister)
 local HistoryQueries = require(script.Parent.HistoryQueries)
 
 local TREE_REBUILD_CHECK_INTERVAL = Settings.TREE_REBUILD_CHECK_INTERVAL
-local REFIT_BUDGET = Settings.HISTORY_REFIT_BUDGET
+local PARTIAL_REBUILD_RATIO_THRESHOLD = Settings.PARTIAL_REBUILD_RATIO_THRESHOLD
+local FULL_REBUILD_RATIO_THRESHOLD = Settings.FULL_REBUILD_RATIO_THRESHOLD
+local NODE_REFIT_BUDGET = Settings.NODE_REFIT_BUDGET
+local ENVELOPE_CELL_BUDGET = Settings.ENVELOPE_CELL_BUDGET
 
 local NULL = 0
 
@@ -63,7 +66,7 @@ end
 
 export type Hitbox = HistoryQueries.Hitbox
 
-type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number}
+type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number, node: number}
 
 local HistoricalRefit = {}
 HistoricalRefit.__index = HistoricalRefit
@@ -86,8 +89,30 @@ export type HistoricalRefit = typeof(setmetatable(
 		slotCount: {number},
 		--internal node indices, children before parents, so refit is a forward loop
 		order: {number},
+		--subsequence of order whose child pair (or a descendant's) changed since prevC1/prevC2 was
+		--last snapshotted. what a dirty slot actually needs refit over, instead of all of order
+		dirtyOrder: {number},
+		--child1/child2 as of the last moment every slot was fully consistent with the topology.
+		--only advances once a drain fully catches up (see UpdateFrame); frozen while one is in
+		--flight, so a second change mid-drain diffs against the same baseline as the first
+		prevC1: {number},
+		prevC2: {number},
+		--scratch reused by computeDirtyOrder's validity walk; entries are always written before
+		--they're read within the same call, so it never needs clearing between calls
+		validScratch: {boolean},
 		topologyDirty: boolean,
 		nextRebuildCheck: number,
+		--slotCostRatio's reading as of the last rebuild; nil forces the first rebuild, since bolt's
+		--own should_rebuild bootstrap only fires above its proxy threshold and this tree is never
+		--restructured by movement
+		baseCostRatio: number?,
+		--the rebuild check staged across captures so its three costs (the cheap ratio check, the
+		--envelope sweep, and the rebuild itself) never land in the same frame. idle is the default:
+		--nothing runs until nextRebuildCheck trips a fresh ratio check, at which point it either
+		--stays idle (ratio's fine) or moves to sweeping.
+		stage: "idle" | "sweeping" | "rebuilding",
+		--how far the sweep has cursored into partList; reset to 0 on entering "sweeping"
+		envSweepCursor: number,
 		hitboxes: {[number]: {[number]: Hitbox}},
 		parts: {[BasePart]: PartInfo},
 		partList: {PartInfo},
@@ -156,12 +181,15 @@ local function relinearize(self: HistoricalRefit)
 	end
 end
 
---the whole per-frame cost of this backend: one forward pass, two vector ops per internal node
-local function refitSlot(self: HistoricalRefit, index: number)
+--the whole per-frame cost of this backend: one forward pass, two vector ops per internal node.
+--the slot just captured this frame passes self.order (every leaf's box just changed, so every
+--internal node needs recomputing); a stale slot being caught up to a topology change instead
+--passes self.dirtyOrder, since its leaf boxes are untouched and only the nodes actually affected
+--by the change can have gone stale
+local function refitSlot(self: HistoricalRefit, index: number, order: {number})
 	local tree = self.tree
 	local child1 = tree.child1
 	local child2 = tree.child2
-	local order = self.order
 	local mn = self.slotMin[index]
 	local mx = self.slotMax[index]
 
@@ -176,6 +204,80 @@ local function refitSlot(self: HistoricalRefit, index: number)
 	self.slotDirty[index] = false
 end
 
+--diffs order against the last fully-consistent snapshot (prevC1/prevC2), walking
+--children-before-parents so a parent's validity can reuse its children's just-computed answer.
+--a node is valid - unaffected by whatever changed - only if its own child pair is unchanged and
+--both children are either leaves or themselves valid; leaves are unconditionally valid, since the
+--capture loop (or AddPart's EMPTY seeding) writes every live leaf's box directly, every slot,
+--regardless of topology. dirtyOrder ends up as just the nodes actually touched: the insertion
+--path plus rotations, not the whole tree.
+local function computeDirtyOrder(self: HistoricalRefit)
+	local tree = self.tree
+	local child1 = tree.child1
+	local child2 = tree.child2
+	local order = self.order
+	local prevC1 = self.prevC1
+	local prevC2 = self.prevC2
+	local valid = self.validScratch
+	local dirtyOrder = self.dirtyOrder
+
+	local count = 0
+	for k = 1, #order do
+		local node = order[k]
+		local c1 = child1[node]
+		local c2 = child2[node]
+		local c1Valid = child1[c1] == NULL or valid[c1]
+		local c2Valid = child1[c2] == NULL or valid[c2]
+		local nodeValid = c1 == prevC1[node] and c2 == prevC2[node] and c1Valid and c2Valid
+		valid[node] = nodeValid
+		if not nodeValid then
+			count += 1
+			dirtyOrder[count] = node
+		end
+	end
+
+	for k = #dirtyOrder, count + 1, -1 do
+		dirtyOrder[k] = nil
+	end
+end
+
+--a topology change invalidates internal bounds tree-wide, but computeDirtyOrder's diff against
+--the last consistent snapshot usually shows only a small fraction actually changed - the drain
+--and bind's lazy fallback both refit dirtyOrder instead of every slot's full order. prevC1/prevC2
+--only advance once every slot has actually caught up (see UpdateFrame's snapshotTopology call):
+--while a drain is in flight, a second change here diffs against that same old snapshot, so
+--dirtyOrder grows to the union of every change since the last time every slot was consistent.
+local function handleTopologyChange(self: HistoricalRefit)
+	relinearize(self)
+	computeDirtyOrder(self)
+	for slot = 1, self.frameCap do
+		self.slotDirty[slot] = true
+	end
+end
+
+--only called once a drain fully catches every slot up to the current topology (UpdateFrame), so
+--the diff the next topology change computes starts from a baseline every slot actually matches.
+--only order's entries matter: computeDirtyOrder only ever looks up prevC1/prevC2 for node indices
+--drawn from order. an entry for an index that falls out of order (freed by a rebuild) is simply
+--never read again - and if that index is later recycled, a coincidental match is still correct,
+--per the invariant computeDirtyOrder relies on: matching children means the same subtree.
+local function snapshotTopology(self: HistoricalRefit)
+	local tree = self.tree
+	local child1 = tree.child1
+	local child2 = tree.child2
+	local order = self.order
+	local prevC1 = self.prevC1
+	local prevC2 = self.prevC2
+
+	for k = 1, #order do
+		local node = order[k]
+		prevC1[node] = child1[node]
+		prevC2[node] = child2[node]
+	end
+
+	table.clear(self.dirtyOrder)
+end
+
 --point the tree at a slot's bounds so bolt's own traversals run against that frame.
 --returns false when the slot holds nothing worth traversing.
 local function bind(self: HistoricalRefit, index: number): boolean
@@ -186,14 +288,11 @@ local function bind(self: HistoricalRefit, index: number): boolean
 	--RemovePart runs from an Observer and a rebuild lands at the end of UpdateFrame, so a query
 	--can arrive while `order` still describes the previous topology
 	if self.topologyDirty then
-		relinearize(self)
-		for slot = 1, self.frameCap do
-			self.slotDirty[slot] = true
-		end
+		handleTopologyChange(self)
 	end
 
 	if self.slotDirty[index] then
-		refitSlot(self, index)
+		refitSlot(self, index, self.dirtyOrder)
 	end
 
 	local tree = self.tree
@@ -211,39 +310,77 @@ end
 --the topology is shared by every frame, so the boxes it is built from should describe the whole
 --window rather than any single frame: each leaf gets the union of its own bounds across the slots
 --it is live in. leaves with no live slot keep whatever they were inserted with, so the arrays the
---SAH builder reads stay finite.
-local function refreshEnvelope(self: HistoricalRefit)
+--SAH builder reads stay finite. The sweep itself lives in UpdateFrame's "sweeping" stage, cursored
+--over partList a budget at a time; this bottom-up pass is its last step, run once the cursor
+--finishes a full pass. Without it, internal env bounds would keep whatever they were at the last
+--rebuild - the sweep only ever writes LEAF env boxes - so should_rebuild-style checks against the
+--envelope would end up biased toward "nothing changed". It mirrors bolt's own refit() rule
+--(aabb_tree.luau:596-599) for
+--`enlarged`: a node's env box only ever grows here (it's a running union across the whole window),
+--so growth is flagged and never cleared. That flag is what lets partial_rebuild respond to
+--envelope drift and not just to inserts - without it, a box that only ever shrank (a player who
+--stopped moving) would never get flagged, and nothing would ever dissolve its subtree.
+local function refitEnvelopeInternals(self: HistoricalRefit)
 	local tree = self.tree
+	local child1 = tree.child1
+	local child2 = tree.child2
+	local enlarged = tree.enlarged
 	local envMin = self.envMin
 	local envMax = self.envMax
-	local slotMin = self.slotMin
-	local slotMax = self.slotMax
-	local hitboxes = self.hitboxes
-	local frameCap = self.frameCap
+	local order = self.order
 
-	for id, node in tree.leaf_map do
-		local mn: vector? = nil
-		local mx: vector? = nil
+	for k = 1, #order do
+		local node = order[k]
+		local c1 = child1[node]
+		local c2 = child2[node]
+		local prevMin = envMin[node]
+		local prevMax = envMax[node]
+		local newMin = vector.min(envMin[c1], envMin[c2])
+		local newMax = vector.max(envMax[c1], envMax[c2])
+		envMin[node] = newMin
+		envMax[node] = newMax
 
-		for slot = 1, frameCap do
-			if hitboxes[slot][id] then
-				local a = slotMin[slot][node]
-				local b = slotMax[slot][node]
-				if mn then
-					mn = vector.min(mn :: vector, a)
-					mx = vector.max(mx :: vector, b)
-				else
-					mn = a
-					mx = b
-				end
-			end
-		end
-
-		if mn then
-			envMin[node] = mn :: vector
-			envMax[node] = mx :: vector
+		local prevSize = prevMax - prevMin
+		local newSize = newMax - newMin
+		if vector.dot(newSize :: vector, newSize :: vector) > vector.dot(prevSize :: vector, prevSize :: vector) then
+			enlarged[node] = true
 		end
 	end
+end
+
+--bolt's own aabb_sah (aabb_tree.luau:50-53), reimplemented here since it isn't exported: half the
+--surface area of a box, the standard SAH proxy. d.x*d.y + d.y*d.z + d.z*d.x for size d = max - min.
+local function aabbSAH(mn: vector, mx: vector): number
+	local d = mx - mn
+	return d.x * d.y + d.y * d.z + d.z * d.x
+end
+
+--queries traverse a SLOT's bounds, not the envelope, so the rebuild trigger should measure what a
+--query actually pays for - consistent by construction, since refitSlot just ran on this slot this
+--frame (whichever slot `index` is: the one just captured). Sampling a single slot trades a little
+--noise (a given frame's grouping may happen to be unusually good or bad) for that consistency: a
+--spurious rebuild costs one paced spike, not a wrong answer.
+local function slotCostRatio(self: HistoricalRefit, index: number): number
+	local order = self.order
+	local mn = self.slotMin[index]
+	local mx = self.slotMax[index]
+
+	local cost = 0
+	for k = 1, #order do
+		local node = order[k]
+		cost += aabbSAH(mn[node], mx[node])
+	end
+
+	--EMPTY_MIN/EMPTY_MAX boxes (not-yet-captured or not-inWorld leaves) would corrupt the ratio,
+	--so sum leaf cost from the slot's own live hitboxes rather than every node in leaf_map
+	local leafCost = 0
+	for _, info in self.partList do
+		if self.hitboxes[index][info.id] then
+			leafCost += aabbSAH(mn[info.node], mx[info.node])
+		end
+	end
+
+	return cost / leafCost
 end
 
 function HistoricalRefit.new(frameCap: number, padding: number): HistoricalRefit
@@ -264,8 +401,15 @@ function HistoricalRefit.new(frameCap: number, padding: number): HistoricalRefit
 	self.slotCount = {}
 	self.hitboxes = {}
 	self.order = {}
+	self.dirtyOrder = {}
+	self.prevC1 = {}
+	self.prevC2 = {}
+	self.validScratch = {}
 	self.topologyDirty = false
 	self.nextRebuildCheck = os.clock() + TREE_REBUILD_CHECK_INTERVAL
+	self.baseCostRatio = nil
+	self.stage = "idle"
+	self.envSweepCursor = 0
 
 	for index = 1, frameCap do
 		self.slotMin[index] = {}
@@ -289,20 +433,24 @@ function HistoricalRefit.AddPart(self: HistoricalRefit, register: PartRegister.P
 	end
 
 	self.nextPartId += 1
-	local info: PartInfo = {id = self.nextPartId, part = part, register = register, listIndex = #self.partList + 1}
-	self.parts[part] = info
-	table.insert(self.partList, info)
+	local id = self.nextPartId
 
 	local tree = self.tree
 	unbind(self)
 
 	--seeded at the part's current pose so the topology is sensible before any frame is captured;
 	--refreshEnvelope widens it to the window once there is history to widen it with
-	tree:insert(info.id, part.CFrame, bolt.create_box(part.Size))
+	tree:insert(id, part.CFrame, bolt.create_box(part.Size))
+	--leaf indices survive both rebuild kinds, so caching it once here avoids a leaf_map lookup
+	--per part in every capture
+	local node = tree.leaf_map[id]
+
+	local info: PartInfo = {id = id, part = part, register = register, listIndex = #self.partList + 1, node = node}
+	self.parts[part] = info
+	table.insert(self.partList, info)
 
 	--every leaf must have bounds in every slot before that slot can be refit, even the slots
 	--this part has not been captured into yet
-	local node = tree.leaf_map[info.id]
 	for index = 1, self.frameCap do
 		self.slotMin[index][node] = EMPTY_MIN
 		self.slotMax[index][node] = EMPTY_MAX
@@ -351,11 +499,10 @@ end
 
 function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 	if self.topologyDirty then
-		relinearize(self)
+		handleTopologyChange(self)
 	end
 
 	local tree = self.tree
-	local leafMap = tree.leaf_map
 	local frameHitboxes = self.hitboxes[index]
 	local mn = self.slotMin[index]
 	local mx = self.slotMax[index]
@@ -365,7 +512,7 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 		local register = info.register
 		register:Step()
 		local id = info.id
-		local node = leafMap[id]
+		local node = info.node
 		local hitbox = frameHitboxes[id]
 
 		if not register.inWorld then
@@ -417,40 +564,155 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 	end
 
 	self.slotCount[index] = count
-	refitSlot(self, index)
+	refitSlot(self, index, self.order)
 
-	--a structural change dirties every slot at once. draining a few per frame keeps that cost
-	--off whichever query happens to land on a stale slot first.
-	local budget = REFIT_BUDGET
+	--the drain doesn't have to guarantee termination on its own: the capture above already cleared
+	--`index`'s own flag unconditionally, so every slot is refit at least once every frameCap
+	--captures for free, and the backlog - one boolean per slot - can never grow past the ring. The
+	--drain only shortens the wait for a slot that would otherwise be queried before its natural
+	--rewrite, so it can be capped hard without ever failing to finish; no wall clock needed.
 	local slotDirty = self.slotDirty
-	for offset = 1, self.frameCap do
-		if budget <= 0 then
-			break
-		end
-		local slot = wrapIndex(index + offset, self.frameCap)
+	local remaining = 0
+	for slot = 1, self.frameCap do
 		if slotDirty[slot] then
-			refitSlot(self, slot)
-			budget -= 1
+			remaining += 1
 		end
 	end
 
-	local now = os.clock()
-	if now >= self.nextRebuildCheck then
-		self.nextRebuildCheck = now + TREE_REBUILD_CHECK_INTERVAL
+	if remaining > 0 then
+		--budgeted in units of work (node refits), not slots, so it scales on the size of the
+		--change (post-Step-2, #dirtyOrder) rather than part count: a small AddPart diff drains the
+		--whole ring in one capture, while a full_rebuild at 800 parts paces itself over several.
+		local maxSlots = math.max(1, NODE_REFIT_BUDGET // math.max(1, #self.dirtyOrder))
 
-		unbind(self)
-		refreshEnvelope(self)
-
-		--should_rebuild needs a baseline to compare against, and only establishes one on its own
-		--above bolt's proxy threshold. this tree is never restructured by movement, so without
-		--the first rebuild small part counts would keep their insertion-order topology forever.
-		if tree.base_cost_ratio == nil or tree:should_rebuild() then
-			tree:full_rebuild()
-			self.topologyDirty = true
-			for slot = 1, self.frameCap do
-				slotDirty[slot] = true
+		local drained = 0
+		--newest-first: slot index+1 is overwritten by the very next capture, so refitting it here
+		--would be wasted work; slot index-1 survives frameCap-1 more captures, maximising the
+		--useful life of every refit this loop spends
+		for offset = 1, self.frameCap do
+			if drained >= maxSlots then
+				break
+			end
+			local slot = wrapIndex(index - offset, self.frameCap)
+			if slotDirty[slot] then
+				refitSlot(self, slot, self.dirtyOrder)
+				drained += 1
 			end
 		end
+
+		remaining -= drained
+	end
+
+	--checked unconditionally, not nested in the branch above: the ring can also reach fully-clean
+	--through natural per-frame captures alone, with no drain ever running this frame (`remaining`
+	--already 0 at the top) - that still means every slot has caught up, so the next topology
+	--change's diff should start from a baseline every slot actually matches. `remaining > 0` above
+	--covers most of it, but nesting this in there would miss a backlog whose last slot happened to
+	--heal on its own natural turn.
+	if remaining == 0 and #self.dirtyOrder > 0 then
+		snapshotTopology(self)
+	end
+
+	--staged so the three costs below never share a frame: idle's own check is one slotCostRatio
+	--(O(nodes)); sweeping is the O(#partList * frameCap) envelope union, paid only once a check
+	--actually trips, not on every idle check; rebuilding is the SAH build itself. Each capture does
+	--at most one stage's worth of work.
+	if self.stage == "idle" then
+		local now = os.clock()
+		if now >= self.nextRebuildCheck then
+			self.nextRebuildCheck = now + TREE_REBUILD_CHECK_INTERVAL
+
+			--baseCostRatio nil forces the first rebuild - see its declaration for why. Otherwise
+			--this is exactly the cheap check that lets most intervals skip the sweep entirely: no
+			--envelope work happens unless the slot just captured already reads as degraded.
+			local shouldSweep = self.baseCostRatio == nil
+				or slotCostRatio(self, index) > self.baseCostRatio * PARTIAL_REBUILD_RATIO_THRESHOLD
+
+			if shouldSweep then
+				self.stage = "sweeping"
+				self.envSweepCursor = 0
+			end
+		end
+	elseif self.stage == "sweeping" then
+		--the same union refreshEnvelope did in one shot, cursored over partList instead of
+		--leaf_map so a mutation mid-sweep (AddPart/RemovePart landing between captures) is just an
+		--array whose current length this reads fresh each capture, never something unsafe to walk.
+		--this unions boxes from slots that may be mid-rewrite underneath it - fine, since the
+		--envelope is a heuristic SAH input, not a correctness bound.
+		local partList = self.partList
+		local total = #partList
+		local slotMin = self.slotMin
+		local slotMax = self.slotMax
+		local hitboxes = self.hitboxes
+		local envMin = self.envMin
+		local envMax = self.envMax
+		local frameCap = self.frameCap
+
+		local partsPerCapture = math.max(1, ENVELOPE_CELL_BUDGET // frameCap)
+		local cursor = self.envSweepCursor
+		local upto = math.min(cursor + partsPerCapture, total)
+
+		for i = cursor + 1, upto do
+			local info = partList[i]
+			local id = info.id
+			local node = info.node
+			local leafMn: vector? = nil
+			local leafMx: vector? = nil
+
+			for slot = 1, frameCap do
+				if hitboxes[slot][id] then
+					local a = slotMin[slot][node]
+					local b = slotMax[slot][node]
+					if leafMn then
+						leafMn = vector.min(leafMn :: vector, a)
+						leafMx = vector.max(leafMx :: vector, b)
+					else
+						leafMn = a
+						leafMx = b
+					end
+				end
+			end
+
+			if leafMn then
+				envMin[node] = leafMn :: vector
+				envMax[node] = leafMx :: vector
+			end
+		end
+
+		self.envSweepCursor = upto
+
+		if upto >= total then
+			--RemovePart's swap-removal can move an unswept part to an already-swept index; it then
+			--keeps the env box AddPart seeded from its current pose for one generation. harmless.
+			refitEnvelopeInternals(self)
+			self.stage = "rebuilding"
+		end
+	elseif self.stage == "rebuilding" then
+		unbind(self)
+
+		--partial_rebuild is the routine path: it only touches subtrees bolt already flagged
+		--enlarged (an insert, or refitEnvelopeInternals' envelope-growth marking), so it pays for a
+		--smaller SAH build and, via Step 2's dirtyOrder, a smaller refit backlog too. full_rebuild
+		--is the floor for the case partial can't fix: a box that only ever shrank never gets
+		--flagged, so nothing dissolves its subtree and grouping can drift regardless. idle already
+		--established that a rebuild is warranted, so only the full/partial split is decided here,
+		--against however this capture's own slot reads now - sweeping may have taken several
+		--captures, so this is a fresher sample than the one idle tripped on.
+		if self.baseCostRatio == nil or slotCostRatio(self, index) > self.baseCostRatio * FULL_REBUILD_RATIO_THRESHOLD then
+			tree:full_rebuild()
+		else
+			tree:partial_rebuild()
+		end
+
+		--relinearize + a real diff, rather than just flagging dirty, because slotCostRatio below
+		--needs this frame's own slot refit under the new topology to mean anything - self.order
+		--(and this slot's internal bounds) still describe the topology from before the rebuild
+		--until this runs. dirtyOrder-scoped, so a partial_rebuild's cost here stays proportional to
+		--what it actually touched; only a full_rebuild makes this a full refit.
+		handleTopologyChange(self)
+		refitSlot(self, index, self.dirtyOrder)
+		self.baseCostRatio = slotCostRatio(self, index)
+		self.stage = "idle"
 	end
 end
 
@@ -497,6 +759,10 @@ function HistoricalRefit.Destroy(self: HistoricalRefit)
 	end
 
 	table.clear(self.order)
+	table.clear(self.dirtyOrder)
+	table.clear(self.prevC1)
+	table.clear(self.prevC2)
+	table.clear(self.validScratch)
 	table.clear(self.parts)
 	table.clear(self.partList)
 end

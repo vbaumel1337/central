@@ -222,19 +222,24 @@ shortens the window itself rather than clamping against one that outlasts it.
 ## History storage
 
 History is sampled on its own cadence, not once per simulation step. Roblox
-replicates player characters at roughly 20 Hz, so capturing at 60 stored two
-duplicates for every real sample. `Settings.HISTORY_CAPTURE_DIVISOR` (default
-`3`) captures one sample every N steps, and `FRAME_CAP` (default `20`) is how
-many samples are kept.
+replicates player characters at roughly 20 Hz, so naively capturing every
+step at a higher `StepFrequency` would store more duplicates than that
+replication rate needs. `Settings.HISTORY_CAPTURE_DIVISOR` (default `1.5`,
+at `StepFrequency = Hz30`) captures one sample every N steps, and `FRAME_CAP`
+(default `20`) is how many samples are kept. Fractional divisors are
+supported — the capture loop carries the remainder rather than rounding up
+every period, so `1.5` genuinely averages to one capture every 1.5 steps
+(20 Hz at `Hz30`) instead of behaving like `2`.
 
 `Settings.MAX_LATENCY` is derived from those two rather than set by hand, so
 the clamp on a rewind can never outrun the history it has to resolve against.
 The reachable span is `FRAME_CAP - 1` capture intervals, not `FRAME_CAP`: the
 worst case is the instant after a capture, when the oldest slot has just been
 overwritten. That is
-`(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency`, or `19 * 3 / 60`
-= **0.95s** at the defaults. Widen the window by raising `FRAME_CAP`, and
-`MAX_LATENCY` follows.
+`(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency`, or `19 * 1.5 / 30`
+= **0.95s** at the defaults (the same 20 Hz capture rate `19 * 3 / 60` gave
+before `StepFrequency`'s default moved to `Hz30`). Widen the window by
+raising `FRAME_CAP`, and `MAX_LATENCY` follows.
 
 A stamp older than the oldest surviving sample is the failure this prevents:
 it has no pair of samples to bracket between, so the rewind lands on the end
@@ -697,7 +702,7 @@ runtime, is the safe way to change a default.
 |---|---|---|
 | `DEBUG_MODE` | `false` | Draws rays/hitboxes for every query, and gates the `Show`/`Hide`Hitboxes functions. Costs performance, leave off outside debugging. |
 | `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. |
-| `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop runs. History is captured every `HISTORY_CAPTURE_DIVISOR` of those steps. |
+| `StepFrequency` | `Hz30` | How often Central's `BindToSimulation` loop runs. History is captured every `HISTORY_CAPTURE_DIVISOR` of those steps. |
 | `HitboxStepPriority` | `1000` | Priority Central's internal binding runs at; your own query-calling bindings need a higher number. |
 | `AUTO_ADD_CHARACTERS` | `true` | Auto-tags every part of a spawning player's character as an owned hitbox. |
 | `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | Fallback query group for an unregistered `CollisionGroup`. |
@@ -707,8 +712,8 @@ runtime, is the safe way to change a default.
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
-| `FRAME_CAP` | `20` | How many history samples are kept. The rewind window they span is `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` (19 × 3 @ 60 Hz = 0.95s), and `MAX_LATENCY` is derived from it. |
-| `HISTORY_CAPTURE_DIVISOR` | `3` | Capture one history sample every N simulation steps. Roblox replicates characters at ~20 Hz, so capturing every step at 60 stored duplicates. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
+| `FRAME_CAP` | `20` | How many history samples are kept. The rewind window they span is `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` (19 × 1.5 @ 30 Hz = 0.95s), and `MAX_LATENCY` is derived from it. |
+| `HISTORY_CAPTURE_DIVISOR` | `1.5` | Capture one history sample every N simulation steps; fractional values are supported and average out correctly (the capture loop carries the remainder rather than rounding up every period). Roblox replicates characters at ~20 Hz — at the default `Hz30`, `1.5` lands exactly on that rate. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
 | `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
 | `HISTORY_BACKEND` | `"refit"` | `"refit"` keeps one shared topology with per-sample bounds refit bottom-up; capture cost stays flat per hitbox. `"trees"` keeps one AABB tree per history sample, the original implementation. Identical query semantics either way. |
 | `NODE_REFIT_BUDGET` | `150` | `refit` backend only. How many internal-node refits `UpdateFrame`'s drain spends per capture catching stale samples up to a structural change, divided by the size of the change so total cost stays roughly constant regardless of how big the triggering change was. |

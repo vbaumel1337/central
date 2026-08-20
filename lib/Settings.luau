@@ -6,7 +6,7 @@ local Settings = {
     DEBUG_MODE = false,
     DEBUG_LIFETIME = 1.5,
 
-    StepFrequency = Enum.StepFrequency.Hz60,
+    StepFrequency = Enum.StepFrequency.Hz30,
     HitboxStepPriority = 1000,
 
     AUTO_ADD_CHARACTERS  = true,
@@ -26,12 +26,14 @@ local Settings = {
     -- (FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency seconds, and MAX_LATENCY is
     -- derived from it below. Raise this to rewind further back.
     FRAME_CAP = 20,
-    -- capture one sample every N simulation steps. Roblox replicates player characters at about
-    -- 20Hz, so capturing at 60 stored two duplicates for every real sample. A rewind resolves by
-    -- blending the two samples it falls between, so a longer interval costs accuracy only for
-    -- parts that move far within it, not for characters.
-    -- Set to 1 to capture every step, which restores the old sampling.
-    HISTORY_CAPTURE_DIVISOR = 3,
+    -- capture one sample every N simulation steps. A rewind resolves by blending the two samples
+    -- it falls between, so a longer interval costs accuracy only for parts that move far within
+    -- it, not for characters.
+    -- Fractional values are supported and average out correctly over time (the capture loop
+    -- carries the remainder instead of rounding up every period) rather than behaving like
+    -- ceil(N) - useful if you want a capture rate that isn't a whole fraction of StepFrequency.
+    -- 1 captures every step, which at the default StepFrequency = Hz30 is a 30Hz capture rate.
+    HISTORY_CAPTURE_DIVISOR = 1,
     -- extra samples either side of the resolved bracket to search. The bracket is already the
     -- exact rewind time, so this exists for hitboxes that move far enough between captures that
     -- the bracket's own bounds might not contain them.
@@ -85,10 +87,22 @@ local Settings = {
     --             implementation, kept as an escape hatch and as the reference that "refit" is
     --             differentially tested against.
     HISTORY_BACKEND = "refit" :: "trees" | "refit",
-    -- refit backend only: how many stale history slots UpdateFrame re-refits per frame. A part
-    -- being added or removed restructures the shared topology and invalidates every slot's
-    -- internal nodes at once, and this spreads that cost instead of landing it on one query.
-    HISTORY_REFIT_BUDGET = 4,
+    -- refit backend only: how many internal-node refits (as in, one iteration of refitSlot's own
+    -- loop) UpdateFrame's drain will spend per capture catching stale slots up to a structural
+    -- change. Divided by the size of the change (#dirtyOrder) to get how many slots that buys this
+    -- capture, so the total cost stays ~budget regardless of how big the change was - a small
+    -- AddPart diff drains the whole ring in one capture, a full_rebuild paces itself over several.
+    -- 150 targets ~30-60us/capture at 800 hitboxes, from the ~0.21-0.26us/hitbox refit cost the
+    -- README's capture-cost table measured (not yet re-measured against this backend's own drain).
+    NODE_REFIT_BUDGET = 150,
+    -- refit backend only: how many (leaf, slot) cells the envelope sweep unions per capture, once
+    -- a rebuild check trips and the sweep stage starts. Divided by frameCap to get how many parts
+    -- that buys this capture, so a full sweep over #partList*frameCap cells spans however many
+    -- captures it takes - the point of staging it is that this cost is paid only on a check that's
+    -- actually going to rebuild, never on the (far more common) checks that don't. Matches
+    -- NODE_REFIT_BUDGET's scale as a starting point; a cell is cheaper than a node refit, so this
+    -- is likely conservative - re-measure once this backend's own timings are re-run.
+    ENVELOPE_CELL_BUDGET = 3000,
 
     -- seconds between should_rebuild checks on each historical tree. the check is a full scan over
     -- the tree's nodes, so running it on every frame update is wasteful when the trees stay balanced
@@ -96,6 +110,17 @@ local Settings = {
     -- fraction of the interval used to randomise each tree's next check, on top of the even initial
     -- stagger, so the trees never drift into checking (and rebuilding) on the same frame
     TREE_REBUILD_CHECK_JITTER = 0.2,
+
+    -- refit backend only: how far a rebuild check's slotCostRatio (this backend's own SAH-ratio
+    -- measurement of the slot it just captured) is allowed to drift above the ratio recorded at
+    -- the last rebuild before triggering another one. PARTIAL is bolt's own REBUILD_RATIO_THRESHOLD
+    -- default (1.5) - a partial_rebuild only touches subtrees bolt already flagged `enlarged`, so
+    -- tripping it early is cheap. FULL is a coarser, unmeasured-so-far multiple: partial_rebuild
+    -- can only improve regions that got flagged (an insert, or an envelope box that grew), so
+    -- boxes that only ever shrink can drift in ways nothing dissolves - FULL is the floor that
+    -- catches that case. Re-measure both once Step 1's re-measurement pass covers this backend.
+    PARTIAL_REBUILD_RATIO_THRESHOLD = 1.5,
+    FULL_REBUILD_RATIO_THRESHOLD = 3.0,
 
     LATENCY_OFFSET = 0, -- seconds added to the clamped latency measurement before it's stored
     LATENCY_SAMPLE_WINDOW = 5, -- number of recent remote reports averaged into the latency attribute
@@ -125,7 +150,7 @@ local Settings = {
 --So it is derived rather than configured. A sample is captured every HISTORY_CAPTURE_DIVISOR
 --steps and the ring holds FRAME_CAP of them, so the reachable span is FRAME_CAP - 1 intervals:
 --the worst case is the instant after a capture, when the oldest slot has just been overwritten.
---At the defaults that is 19 * 3 / 60 = 0.95s, where a hand-set 1s was 0.05s too generous.
+--At the defaults that is 19 * 1 / 30 = 0.6333s.
 --
 --It is read through __index rather than stored, so it stays correct when FRAME_CAP, the divisor,
 --or StepFrequency are changed before Central.Start().

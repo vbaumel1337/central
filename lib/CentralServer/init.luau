@@ -242,12 +242,15 @@ function CentralServer.Start()
 		end
 		table.clear(RegistersPending)
 
-		--history is sampled on its own cadence; a rewind lands between samples and is blended
+		--history is sampled on its own cadence; a rewind lands between samples and is blended.
+		--carrying the remainder instead of resetting to 0 is what makes a fractional divisor
+		--(1.5, say) average out to the right rate over time rather than rounding up to ceil(it)
+		--every single period.
 		stepsSinceCapture += 1
 		if stepsSinceCapture < CAPTURE_DIVISOR then
 			return
 		end
-		stepsSinceCapture = 0
+		stepsSinceCapture -= CAPTURE_DIVISOR
 
 		GlobalTimeRegister:Step()
 
