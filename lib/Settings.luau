@@ -68,14 +68,14 @@ local Settings = {
     -- where the querying player's OWN hitboxes are resolved. They are never lag compensated
     -- (a player sees their own character where the server has it), so either way they resolve at
     -- "now"; this only picks which structure answers.
-    --   "history" - the history structure at its newest sample. One traversal, filters handled
-    --               internally, and `check` costs nothing extra. Owned parts resolve against the
-    --               same box approximation as everyone else's, and are up to one capture interval
-    --               stale rather than live.
+    --   "history" - a flat scan over the player's own tagged parts, posed at their live CFrame.
+    --               No engine round-trip, filters handled internally, and `check` costs nothing
+    --               extra. Owned parts resolve against a box approximation rather than true
+    --               engine geometry - the only remaining trade against "live".
     --   "live"    - a second workspace query with IncludeInstances set to the owned parts. True
-    --               engine geometry and genuinely current, at the cost of marshalling the include
-    --               list per query and, when `check` is set, an iterative exclude-and-retry loop.
-    -- Prefer "live" if you tag fast movers (projectiles, vehicles) or non-box shapes as hitboxes.
+    --               engine geometry, at the cost of marshalling the include list per query and,
+    --               when `check` is set, an iterative exclude-and-retry loop.
+    -- Prefer "live" if you tag non-box shapes as hitboxes.
     OWNED_HITBOX_SOURCE = "history" :: "history" | "live",
 
     -- which history backend CentralServer builds. Both expose the same interface and the same

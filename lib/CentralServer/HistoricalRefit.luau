@@ -534,9 +534,9 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 			current = {
 				id = id,
 				cframe = cframe,
-				shape = bolt.create_box(size),
+				shape = register.shape,
 				size = size,
-				boundingRadius = size.Magnitude / 2,
+				boundingRadius = register.boundingRadius,
 				instance = info.part,
 				owner = register.owner,
 				collisionGroup = register.collisionGroup,
@@ -550,8 +550,8 @@ function HistoricalRefit.UpdateFrame(self: HistoricalRefit, index: number)
 			current = hitbox
 			if size ~= current.size then
 				current.size = size
-				current.shape = bolt.create_box(size)
-				current.boundingRadius = size.Magnitude / 2
+				current.shape = register.shape
+				current.boundingRadius = register.boundingRadius
 			end
 			current.cframe = cframe
 			current.canCollide = register.canCollide

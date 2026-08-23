@@ -3,13 +3,13 @@
 --!optimize 2
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
-local Players = game:GetService("Players")
 
 local Registers = script.Registers
 local TimeRegister = require(Registers.TimeRegister)
 local Observers = require(script.Parent.Parent.Observers)
 local HistoricalHitboxes = require(script.HistoricalHitboxes)
 local HistoricalRefit = require(script.HistoricalRefit)
+local OwnedQueries = require(script.OwnedQueries)
 local PartRegister = require(script.Registers.PartRegister)
 local Settings = require(script.Parent.Settings)
 export type Hitbox = HistoricalHitboxes.Hitbox
@@ -94,7 +94,10 @@ local HistoricalIndex: HistoricalHitboxes.HistoricalHitboxes = if Settings.HISTO
 
 local RegistersPending:{PartRegister.PartRegister} = {}
 
-local OwnedHitboxParts = {} :: {[Player]: {BasePart}}
+--keyed by owner name (the string PartRegister.owner holds) rather than by Player instance, so
+--this and the compensated pass's `hitbox.owner == playerName` test agree by construction: a part
+--tagged before its owning Player exists still lands here, instead of falling into neither pass
+local OwnedHitboxRegisters = {} :: {[string]: {PartRegister.PartRegister}}
 
 local PlayerLatencies = {} :: {[Player]: number}
 local stepsSinceCapture = 0
@@ -125,7 +128,16 @@ local function resolveRewind(player: Player): (number, number?, number)
 end
 
 function CentralServer.GetOwnedHitboxParts(player: Player): {BasePart}
-	return OwnedHitboxParts[player] or {}
+	local registers = OwnedHitboxRegisters[player.Name]
+	if not registers then
+		return {}
+	end
+
+	local parts = table.create(#registers)
+	for _, register in registers do
+		table.insert(parts, register.part)
+	end
+	return parts
 end
 
 local hasStarted = false
@@ -173,37 +185,29 @@ function CentralServer.Start()
 			register:UnscheduleDestroy()
 		end
 
-		local owner: Player? = nil
-		local ownerName = part:GetAttribute(Settings.OWNER_ATTRIBUTE)
-		if typeof(ownerName) == "string" then
-			local ownerInstance = Players:FindFirstChild(ownerName)
-			if ownerInstance and ownerInstance:IsA("Player") then
-				owner = ownerInstance
-			end
+		--keyed by the same owner string PartRegister already resolved (defaults to "Server" when
+		--unattributed), not by looking up a live Player instance - a part tagged before its owning
+		--Player exists still lands here, and the compensated pass's `hitbox.owner == playerName`
+		--test already keys off this same string, so the two passes agree by construction
+		local ownerName = register.owner
+		local owned = OwnedHitboxRegisters[ownerName]
+		if not owned then
+			owned = {}
+			OwnedHitboxRegisters[ownerName] = owned
 		end
-
-		if owner then
-			local owned = OwnedHitboxParts[owner]
-			if not owned then
-				owned = {}
-				OwnedHitboxParts[owner] = owned
-			end
-			table.insert(owned, part)
-		end
+		table.insert(owned, register)
 
 		return function()
 			register:ScheduleDestroy()
 
-			if owner then
-				local owned = OwnedHitboxParts[owner]
-				if owned then
-					local index = table.find(owned, part)
-					if index then
-						table.remove(owned, index)
-					end
-					if #owned == 0 then
-						OwnedHitboxParts[owner] = nil
-					end
+			local stillOwned = OwnedHitboxRegisters[ownerName]
+			if stillOwned then
+				local index = table.find(stillOwned, register)
+				if index then
+					table.remove(stillOwned, index)
+				end
+				if #stillOwned == 0 then
+					OwnedHitboxRegisters[ownerName] = nil
 				end
 			end
 		end
@@ -292,26 +296,42 @@ function CentralServer.QueryPlayerShape(player:Player, cframe:CFrame, shape:bolt
 end
 
 --The querying player's own hitboxes are the other half of a merged result: everyone else is
---rewound to what this player saw, but their own character is not, so these resolve at the newest
---sample with no blend and no widening.
+--rewound to what this player saw, but their own character is not, so these resolve at its live
+--CFrame - a flat scan over the player's own registers, not a history lookup at all.
 function CentralServer.QueryOwnedRaycast(player: Player, ray_origin: Vector3, ray_direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
-	return HistoricalIndex:QueryRaycast(player, newestIndex(), nil, 0, 0, ray_origin, ray_direction, params, check, true)
+	local registers = OwnedHitboxRegisters[player.Name]
+	if not registers then
+		return nil, nil, nil, nil
+	end
+	return OwnedQueries.QueryRaycast(registers, ray_origin, ray_direction, params, check)
 end
 
 function CentralServer.QueryOwnedShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, Vector3?, number?, Vector3?)
-	return HistoricalIndex:QueryShapecast(player, newestIndex(), nil, 0, 0, cframe, shape, direction, params, check, true)
+	local registers = OwnedHitboxRegisters[player.Name]
+	if not registers then
+		return nil, nil, nil, nil
+	end
+	return OwnedQueries.QueryShapecast(registers, cframe, shape, direction, params, check)
 end
 
 function CentralServer.QueryOwnedSimpleShapecast(player: Player, cframe: CFrame, shape: bolt.Shape, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (HistoricalHitboxes.Hitbox?, number?)
-	return HistoricalIndex:QuerySimpleShapecast(player, newestIndex(), nil, 0, 0, cframe, shape, direction, params, check, true)
+	local registers = OwnedHitboxRegisters[player.Name]
+	if not registers then
+		return nil, nil
+	end
+	return OwnedQueries.QuerySimpleShapecast(registers, cframe, shape, direction, params, check)
 end
 
 function CentralServer.QueryOwnedShape(player: Player, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: HistoricalHitboxes.Hitbox}
-	return HistoricalIndex:QueryShape(player, newestIndex(), nil, 0, 0, cframe, shape, params, check, true)
+	local registers = OwnedHitboxRegisters[player.Name]
+	if not registers then
+		return {}
+	end
+	return OwnedQueries.QueryShape(registers, cframe, shape, params, check)
 end
 
 function CentralServer.HasOwnedHitboxes(player: Player): boolean
-	local owned = OwnedHitboxParts[player]
+	local owned = OwnedHitboxRegisters[player.Name]
 	return owned ~= nil and #owned > 0
 end
 

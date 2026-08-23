@@ -13,6 +13,7 @@
 ]]
 local Settings = require(script.Parent.Parent.Parent.Settings)
 local Observers = require(script.Parent.Parent.Parent.Parent.Observers)
+local bolt = require(script.Parent.Parent.Parent.bolt)
 
 local PartRegister = {}
 PartRegister.__index = PartRegister
@@ -28,6 +29,11 @@ export type PartRegister = typeof(setmetatable(
 		canCollide: boolean,
 		collisionGroup: string,
 		inWorld: boolean,
+
+		--rebuilt alongside size; cached here so both history backends and the owned-hitbox
+		--scan can read them straight off the register instead of each keeping their own copy
+		shape: bolt.BoxShape,
+		boundingRadius: number,
 
 		_observers: {() -> ()},
 		_pendingDestroy: boolean,
@@ -55,6 +61,9 @@ function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: Pa
 	self.collisionGroup = part.CollisionGroup
 	self.inWorld = part.Parent ~= nil
 
+	self.shape = bolt.create_box(self.size)
+	self.boundingRadius = self.size.Magnitude / 2
+
 	self._pendingDestroy = false
 	self._destroyCountdown = 0
 	self._isDestroyed = false
@@ -66,6 +75,8 @@ function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: Pa
 
 	table.insert(self._observers, Observers.observeProperty(part, "Size", function(size)
 		self.size = (size :: Vector3)
+		self.shape = bolt.create_box(self.size)
+		self.boundingRadius = self.size.Magnitude / 2
 		return
 	end))
 

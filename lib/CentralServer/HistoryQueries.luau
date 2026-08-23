@@ -93,6 +93,7 @@ local function wrapIndex(index: number, frameCap: number): number
 	return ((index - 1) % frameCap) + 1
 end
 HistoryQueries.wrapIndex = wrapIndex
+HistoryQueries.castBoundingRadius = castBoundingRadius
 
 --the pose at the exact rewind time. The bracketing pair is blended rather than snapped to,
 --which is what lets a capture interval longer than a simulation step stay accurate. Falls back
@@ -121,17 +122,20 @@ local function posedCFrame(
 	return anchor.cframe:Lerp(other.cframe, alpha)
 end
 
-local function collides(hitbox: Hitbox, hitboxCFrame: CFrame, cframe: CFrame, shape: bolt.Shape): boolean
+--takes the box shape directly, rather than a whole Hitbox, so a caller that has not built one
+--(the owned-hitbox scan, which allocates a Hitbox only for a winning candidate) can still use it
+local function collides(boxShape: bolt.BoxShape, hitboxCFrame: CFrame, cframe: CFrame, shape: bolt.Shape): boolean
 	if shape.type == shapeMap.BOX then
-		return collision.box_box(hitboxCFrame, hitbox.shape, cframe, shape :: bolt.BoxShape)
+		return collision.box_box(hitboxCFrame, boxShape, cframe, shape :: bolt.BoxShape)
 	elseif shape.type == shapeMap.SPHERE then
-		return collision.box_sphere(hitboxCFrame, hitbox.shape, cframe, shape :: bolt.SphereShape)
+		return collision.box_sphere(hitboxCFrame, boxShape, cframe, shape :: bolt.SphereShape)
 	elseif shape.type == shapeMap.CAPSULE then
-		return collision.box_capsule(hitboxCFrame, hitbox.shape, cframe, shape :: bolt.CapsuleShape)
+		return collision.box_capsule(hitboxCFrame, boxShape, cframe, shape :: bolt.CapsuleShape)
 	end
 
-	return gjk.intersects(hitboxCFrame, hitbox.shape, cframe, shape, GJK_TOLERANCE)
+	return gjk.intersects(hitboxCFrame, boxShape, cframe, shape, GJK_TOLERANCE)
 end
+HistoryQueries.collides = collides
 
 function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Queries
 	local Queries = {}
@@ -535,7 +539,7 @@ function HistoryQueries.create(bindSlot: BindSlot, unbindSlot: UnbindSlot): Quer
 					tested[id] = true
 				end
 
-				if not collides(hitbox, posed, cframe, shape) then
+				if not collides(hitbox.shape, posed, cframe, shape) then
 					continue
 				end
 

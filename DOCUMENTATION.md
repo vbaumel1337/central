@@ -61,8 +61,8 @@ the result sets:
 
 1. **The world**, queried live through `workspace` with every compensated
    hitbox filtered out by collision group.
-2. **The querying player's own hitboxes**, at the newest history sample. A
-   player sees their own character where the server has it, so these are never
+2. **The querying player's own hitboxes**, at their live `CFrame`. A player
+   sees their own character where the server has it, so these are never
    rewound. `Settings.OWNED_HITBOX_SOURCE = "live"` resolves them with a second
    `workspace` query against true engine geometry instead.
 3. **Everyone else's hitboxes**, rewound to what this player actually saw, and
@@ -184,8 +184,8 @@ firing player's own latency, so both sides usually land on the same hit
   the exact time between two samples rather than snapped to the nearest one.
   Widen it only for hitboxes that move far enough within one capture interval
   to escape the bounds of both samples either side.
-- A hitbox owned by the querying player is never rewound: it resolves at the
-  newest history sample rather than at that player's latency. Set
+- A hitbox owned by the querying player is never rewound: it resolves at its
+  live `CFrame` rather than at that player's latency. Set
   `Settings.OWNED_HITBOX_SOURCE = "live"` to resolve it with a second
   `workspace` query against true engine geometry instead.
 - Something that moves every step (e.g. a projectile shapecast each frame)
@@ -714,7 +714,7 @@ runtime, is the safe way to change a default.
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
 | `FRAME_CAP` | `20` | How many history samples are kept. The rewind window they span is `(FRAME_CAP - 1) * HISTORY_CAPTURE_DIVISOR / StepFrequency` (19 × 1.5 @ 30 Hz = 0.95s), and `MAX_LATENCY` is derived from it. |
 | `HISTORY_CAPTURE_DIVISOR` | `1.5` | Capture one history sample every N simulation steps; fractional values are supported and average out correctly (the capture loop carries the remainder rather than rounding up every period). Roblox replicates characters at ~20 Hz — at the default `Hz30`, `1.5` lands exactly on that rate. A rewind blends the two samples it falls between, so a longer interval only costs accuracy for parts that move far within it. `1` captures every step. |
-| `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` uses the history structure's newest sample; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag fast movers or non-box shapes. |
+| `OWNED_HITBOX_SOURCE` | `"history"` | Where the querying player's own hitboxes resolve. `"history"` scans the player's own tagged parts at their live `CFrame` and box approximation; `"live"` uses a second `workspace` query against true engine geometry. Prefer `"live"` if you tag non-box shapes. |
 | `HISTORY_BACKEND` | `"refit"` | `"refit"` keeps one shared topology with per-sample bounds refit bottom-up; capture cost stays flat per hitbox. `"trees"` keeps one AABB tree per history sample, the original implementation. Identical query semantics either way. |
 | `NODE_REFIT_BUDGET` | `150` | `refit` backend only. How many internal-node refits `UpdateFrame`'s drain spends per capture catching stale samples up to a structural change, divided by the size of the change so total cost stays roughly constant regardless of how big the triggering change was. |
 | `ENVELOPE_CELL_BUDGET` | `3000` | `refit` backend only. How many (leaf, sample) cells the envelope sweep unions per capture once a rebuild check trips and the sweep stage starts, divided by `FRAME_CAP` to get how many parts that buys this capture. |
