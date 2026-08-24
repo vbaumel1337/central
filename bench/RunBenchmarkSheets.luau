@@ -95,14 +95,15 @@ function RunBenchmarkSheets.Run(config: Config): {
 		parentFolder = config.parentFolder,
 	}
 
-	local refRaycast, refShapecast = Benchmark.RunSheets(refAdapter, sheetDeps)
-	local newRaycast, newShapecast = Benchmark.RunSheets(newAdapter, sheetDeps)
+	-- Ref and New rows are interleaved (see RunSheets' doc comment) rather than run as two
+	-- separate full passes, so neither adapter is systematically favored by going first.
+	local sheets = Benchmark.RunSheets({refAdapter, newAdapter}, sheetDeps)
 
 	return {
-		refRaycast = refRaycast,
-		refShapecast = refShapecast,
-		newRaycast = newRaycast,
-		newShapecast = newShapecast,
+		refRaycast = sheets.Ref.raycast,
+		refShapecast = sheets.Ref.shapecast,
+		newRaycast = sheets.New.raycast,
+		newShapecast = sheets.New.shapecast,
 	}
 end
 

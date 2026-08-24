@@ -235,113 +235,154 @@ function Benchmark.Run(deps: Deps): {CellResult}
 	return results
 end
 
--- Builds one (Raycast, SimpleShapecast) pair of sheets for a single adapter. Row 0 hitboxes
--- isolates pure query overhead against empty trees; column 0 queries isolates UpdateFrame.
--- Query counts within a row are tried in increasing order; once one blows past
--- stepBudgetUs * timeoutMultiple, every costlier column in that row is recorded "over" without
--- being attempted (query cost only grows with count, so there's nothing to learn by trying).
-function Benchmark.RunSheets(adapter: Adapter, deps: SheetDeps): (Sheet, Sheet)
-	local raycastCells: {[number]: {[number]: number | string}} = {}
-	local shapecastCells: {[number]: {[number]: number | string}} = {}
+-- Measures one row (every queryCount, both query kinds) for one adapter at one hitboxCount.
+-- Split out of RunSheets so multiple adapters can be interleaved row-by-row -- see RunSheets'
+-- doc comment for why that ordering matters.
+local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, boxShape: any): ({[number]: number | string}, {[number]: number | string})
+	local raycastRow: {[number]: number | string} = {}
+	local shapecastRow: {[number]: number | string} = {}
 
-	local boxShape = {type = 2 ^ 0, half_extents = Vector3.new(1, 1, 1)} -- shapeMap.BOX; avoids depending on bolt just for this
+	local folder = Instance.new("Folder")
+	folder.Name = "SheetParts_" .. adapter.name .. "_" .. hitboxCount
+	folder.Parent = deps.parentFolder
 
-	for _, hitboxCount in deps.hitboxCounts do
-		raycastCells[hitboxCount] = {}
-		shapecastCells[hitboxCount] = {}
+	local parts = buildGrid(hitboxCount, folder)
+	local hh = adapter.new()
 
-		local folder = Instance.new("Folder")
-		folder.Name = "SheetParts_" .. adapter.name .. "_" .. hitboxCount
-		folder.Parent = deps.parentFolder
+	-- Stagger registration across a full ring rotation instead of adding every part on frame 1.
+	-- Parts added together share a rotation phase forever (all rotate into a new block on the
+	-- exact same frame, every UNION_SIZE frames), which is both unrealistic (a real game's
+	-- hitboxes appear at staggered times: players spawning, projectiles firing) and creates a
+	-- synchronized cost spike once per rotation that skews a short measurement window depending
+	-- on pure luck of where it lands relative to that spike.
+	local partsPerFrame = math.max(1, math.ceil(#parts / adapter.frameCap))
+	local nextToAdd = 1
 
-		local parts = buildGrid(hitboxCount, folder)
-		local hh = adapter.new()
-		local regs = {}
-		for i, p in parts do
-			local reg = deps.PartRegister.new(p, adapter.frameCap)
-			regs[i] = reg
-			adapter.addPart(hh, reg)
+	local index = 0
+	local t = 0
+	local function step()
+		if #parts > 0 then
+			moveAll(parts, t)
 		end
-
-		local index = 0
-		local t = 0
-		local function step()
-			if #parts > 0 then
-				moveAll(parts, t)
+		t += 0.05
+		index = (index % adapter.frameCap) + 1
+		for _ = 1, partsPerFrame do
+			if nextToAdd > #parts then
+				break
 			end
-			t += 0.05
-			index = (index % adapter.frameCap) + 1
-			adapter.updateFrame(hh, index)
+			adapter.addPart(hh, deps.PartRegister.new(parts[nextToAdd], adapter.frameCap))
+			nextToAdd += 1
 		end
-
-		for _ = 1, deps.warmupFrames do
-			step()
-		end
-
-		local rayOrigin = Vector3.new(SPACING * 0.5, 3000, SPACING * 0.5)
-		local rayDir = if #parts > 0
-			then (parts[math.max(1, #parts // 2)].Position - rayOrigin).Unit * RAY_LENGTH
-			else Vector3.new(RAY_LENGTH, 0, 0)
-		local shapeOrigin = CFrame.new(rayOrigin)
-
-		local abortBudget = deps.stepBudgetUs * deps.timeoutMultiple
-		local raycastAborted, shapecastAborted = false, false
-
-		for _, queryCount in deps.queryCounts do
-			if raycastAborted then
-				raycastCells[hitboxCount][queryCount] = "over"
-			else
-				local perFrameUs = measureBatched(function()
-					step()
-					for _ = 1, queryCount do
-						adapter.queryRaycast(hh, index, rayOrigin, rayDir)
-					end
-				end, deps.numBatches, deps.framesPerBatch)
-				if perFrameUs > abortBudget then
-					raycastAborted = true
-					raycastCells[hitboxCount][queryCount] = "over"
-				else
-					raycastCells[hitboxCount][queryCount] = perFrameUs / deps.stepBudgetUs * 100
-				end
-			end
-
-			if shapecastAborted then
-				shapecastCells[hitboxCount][queryCount] = "over"
-			else
-				local perFrameUs = measureBatched(function()
-					step()
-					for _ = 1, queryCount do
-						adapter.querySimpleShapecast(hh, index, shapeOrigin, boxShape, rayDir)
-					end
-				end, deps.numBatches, deps.framesPerBatch)
-				if perFrameUs > abortBudget then
-					shapecastAborted = true
-					shapecastCells[hitboxCount][queryCount] = "over"
-				else
-					shapecastCells[hitboxCount][queryCount] = perFrameUs / deps.stepBudgetUs * 100
-				end
-			end
-		end
-
-		adapter.destroy(hh)
-		folder:Destroy()
+		adapter.updateFrame(hh, index)
 	end
 
-	local raycastSheet: Sheet = {
-		adapterName = adapter.name,
-		queryKind = "Raycast",
-		hitboxCounts = deps.hitboxCounts,
-		queryCounts = deps.queryCounts,
-		cellsPct = raycastCells,
-	}
-	local shapecastSheet: Sheet = {
-		adapterName = adapter.name,
-		queryKind = "SimpleShapecast",
-		hitboxCounts = deps.hitboxCounts,
-		queryCounts = deps.queryCounts,
-		cellsPct = shapecastCells,
-	}
-	return raycastSheet, shapecastSheet
+	for _ = 1, deps.warmupFrames do
+		step()
+	end
+
+	local rayOrigin = Vector3.new(SPACING * 0.5, 3000, SPACING * 0.5)
+	local rayDir = if #parts > 0
+		then (parts[math.max(1, #parts // 2)].Position - rayOrigin).Unit * RAY_LENGTH
+		else Vector3.new(RAY_LENGTH, 0, 0)
+	local shapeOrigin = CFrame.new(rayOrigin)
+
+	local abortBudget = deps.stepBudgetUs * deps.timeoutMultiple
+	local raycastAborted, shapecastAborted = false, false
+
+	for _, queryCount in deps.queryCounts do
+		if raycastAborted then
+			raycastRow[queryCount] = "over"
+		else
+			local perFrameUs = measureBatched(function()
+				step()
+				for _ = 1, queryCount do
+					adapter.queryRaycast(hh, index, rayOrigin, rayDir)
+				end
+			end, deps.numBatches, deps.framesPerBatch)
+			if perFrameUs > abortBudget then
+				raycastAborted = true
+				raycastRow[queryCount] = "over"
+			else
+				raycastRow[queryCount] = perFrameUs / deps.stepBudgetUs * 100
+			end
+		end
+
+		if shapecastAborted then
+			shapecastRow[queryCount] = "over"
+		else
+			local perFrameUs = measureBatched(function()
+				step()
+				for _ = 1, queryCount do
+					adapter.querySimpleShapecast(hh, index, shapeOrigin, boxShape, rayDir)
+				end
+			end, deps.numBatches, deps.framesPerBatch)
+			if perFrameUs > abortBudget then
+				shapecastAborted = true
+				shapecastRow[queryCount] = "over"
+			else
+				shapecastRow[queryCount] = perFrameUs / deps.stepBudgetUs * 100
+			end
+		end
+	end
+
+	adapter.destroy(hh)
+	folder:Destroy()
+
+	return raycastRow, shapecastRow
+end
+
+export type SheetPair = {raycast: Sheet, shapecast: Sheet}
+
+-- Builds a (Raycast, SimpleShapecast) sheet pair for EVERY adapter given, measured with rows
+-- interleaved across adapters rather than run one adapter's whole sheet then the next's.
+-- Measuring adapter A's complete sheet before adapter B's means B's every cell is timed after
+-- however much GC pressure/heap fragmentation A's (often heavier) full run left behind --
+-- a real, measured effect in this harness, not a hypothetical one, and it systematically favors
+-- whichever adapter goes first. Interleaving at the row level means both adapters hit each
+-- hitboxCount under comparable accumulated session state.
+--
+-- Row 0 hitboxes isolates pure query overhead against empty trees; column 0 queries isolates
+-- UpdateFrame. Query counts within a row are tried in increasing order; once one blows past
+-- stepBudgetUs * timeoutMultiple, every costlier column in that row is recorded "over" without
+-- being attempted (query cost only grows with count, so there's nothing to learn by trying).
+function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: SheetPair}
+	local boxShape = {type = 2 ^ 0, half_extents = Vector3.new(1, 1, 1)} -- shapeMap.BOX; avoids depending on bolt just for this
+
+	local raycastCells: {[string]: {[number]: {[number]: number | string}}} = {}
+	local shapecastCells: {[string]: {[number]: {[number]: number | string}}} = {}
+	for _, adapter in adapters do
+		raycastCells[adapter.name] = {}
+		shapecastCells[adapter.name] = {}
+	end
+
+	for _, hitboxCount in deps.hitboxCounts do
+		for _, adapter in adapters do
+			local raycastRow, shapecastRow = runRow(adapter, hitboxCount, deps, boxShape)
+			raycastCells[adapter.name][hitboxCount] = raycastRow
+			shapecastCells[adapter.name][hitboxCount] = shapecastRow
+		end
+	end
+
+	local result: {[string]: SheetPair} = {}
+	for _, adapter in adapters do
+		result[adapter.name] = {
+			raycast = {
+				adapterName = adapter.name,
+				queryKind = "Raycast",
+				hitboxCounts = deps.hitboxCounts,
+				queryCounts = deps.queryCounts,
+				cellsPct = raycastCells[adapter.name],
+			},
+			shapecast = {
+				adapterName = adapter.name,
+				queryKind = "SimpleShapecast",
+				hitboxCounts = deps.hitboxCounts,
+				queryCounts = deps.queryCounts,
+				cellsPct = shapecastCells[adapter.name],
+			},
+		}
+	end
+	return result
 end
 
 return Benchmark

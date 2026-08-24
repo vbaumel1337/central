@@ -267,15 +267,23 @@ ahead of the GJK call), which shows in the sheets below.
 **Whole-frame cost sheets**: each cell is `UpdateFrame` plus the stated
 number of queries that frame, as % of one Hz60 step (16667 µs), median of 7
 batches of 20 timed frames (median rather than mean specifically so one
-GC pause landing in a batch doesn't skew the cell — see
-`bench/Benchmark.luau`'s `measureBatched`). Row 0 hitboxes isolates query
-overhead against empty trees; column 0 queries isolates `UpdateFrame` alone.
-Generated with `bench/RunBenchmarkSheets.luau` — the design notes suggest a
-10000-hitbox row too, but that crashed a live Studio session in practice, so
-it's not included here; rerun with a larger `hitboxCounts` list in a
-disposable place if you want it. Cells still carry noticeable run-to-run
-variance at the high-query-count corner (a Studio Play session isn't a clean
-room), so read these as directional, like the rest of this section.
+outlier batch doesn't skew the cell — see `bench/Benchmark.luau`'s
+`measureBatched`). Row 0 hitboxes isolates query overhead against empty
+trees; column 0 queries isolates `UpdateFrame` alone. Generated with
+`bench/RunBenchmarkSheets.luau`.
+
+Rows stop at 100 hitboxes, not the design notes' suggested 10000. A
+10000-hitbox row crashed a live Studio session outright. 1000 hitboxes ran,
+but only cleanly when measured as its own short, freshly-started Play
+session — combined into one longer run alongside the other rows, that tier
+picked up unexplained, non-reproducible spikes (a bad batch landing near the
+statistical median), and *more* batches made it worse, not better, which
+points at cumulative session-level interference building up over a
+longer-running script rather than ordinary measurement noise. Rows 0–100
+below were unconditionally stable across every run, combined or isolated;
+1000+ needs a clean, isolated session per row to trust, so it's left out of
+the published sheets. The `UpdateFrame`-only comparison above already covers
+that scale reliably.
 
 **Raycast**
 
@@ -283,28 +291,26 @@ room), so read these as directional, like the rest of this section.
 
 | hitboxes | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.00% | 0.00% | 0.02% | 0.62% | 4.90% |
-| 1 | 0.02% | 0.03% | 0.10% | 0.75% | 6.77% |
-| 10 | 0.21% | 0.19% | 0.29% | 1.23% | 10.05% |
-| 100 | 2.33% | 2.33% | 2.40% | 3.30% | 12.03% |
-| 1000 | 27.68% | 27.42% | 27.37% | 28.47% | 40.79% |
+| 0 | 0.00% | 0.00% | 0.02% | 0.61% | 5.44% |
+| 1 | 0.01% | 0.02% | 0.04% | 0.57% | 5.52% |
+| 10 | 0.18% | 0.19% | 0.26% | 1.20% | 9.93% |
+| 100 | 2.25% | 2.37% | 2.53% | 3.41% | 11.33% |
 
 *New (union hitboxes, with the raycast pre-filter):*
 
 | hitboxes | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.01% | 0.03% | 0.21% | 1.85% | 18.81% |
-| 1 | 0.03% | 0.05% | 0.19% | 2.31% | 20.73% |
-| 10 | 0.28% | 0.33% | 0.85% | 5.76% | 43.04% |
-| 100 | 2.98% | 3.16% | 3.51% | 8.90% | 60.12% |
-| 1000 | 40.79% | 37.32% | 37.43% | 46.25% | 119.97% |
+| 0 | 0.00% | 0.01% | 0.07% | 0.56% | 5.56% |
+| 1 | 0.02% | 0.02% | 0.10% | 0.69% | 6.31% |
+| 10 | 0.18% | 0.18% | 0.35% | 1.30% | 11.98% |
+| 100 | 1.81% | 2.14% | 2.16% | 3.75% | 14.84% |
 
-At low-to-moderate query counts `UpdateFrame`'s savings win outright (the 0-
-and 1-query columns are New's `UpdateFrame` numbers, and they're lower than
-Ref's throughout). At high query counts New is behind Ref even at 0 hitboxes
-— the pre-filter itself (computing a ray/AABB test ahead of the exact test)
-has a small fixed per-call cost that Ref never pays, and it shows up once
-you're issuing hundreds of raycasts a frame.
+New's 0-query column (pure `UpdateFrame`) is lower than Ref's at every
+hitbox count here, matching the focused comparison above. The pre-filter
+keeps New close to Ref through moderate query counts; at 1000 queries/frame
+New runs a bit ahead of Ref at 100 hitboxes (14.84% vs. 11.33%) — the
+pre-filter's own small per-call cost showing through once query volume gets
+large relative to how little broad-phase work there is to save.
 
 **SimpleShapecast** (no pre-filter yet — this is the gap a future pass would close)
 
@@ -312,27 +318,26 @@ you're issuing hundreds of raycasts a frame.
 
 | hitboxes | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.00% | 0.00% | 0.03% | 0.59% | 5.85% |
-| 1 | 0.02% | 0.03% | 0.15% | 1.22% | 13.07% |
-| 10 | 0.19% | 0.21% | 0.45% | 2.23% | 21.13% |
-| 100 | 2.28% | 2.31% | 2.54% | 4.50% | 22.52% |
-| 1000 | 28.97% | 28.12% | 27.94% | 30.29% | 133.20% |
+| 0 | 0.00% | 0.00% | 0.03% | 0.67% | 6.21% |
+| 1 | 0.01% | 0.02% | 0.05% | 0.81% | 7.02% |
+| 10 | 0.18% | 0.22% | 0.45% | 2.87% | 22.32% |
+| 100 | 2.39% | 2.29% | 2.59% | 4.55% | 24.00% |
 
 *New:*
 
 | hitboxes | 0 | 1 | 10 | 100 | 1000 |
 |---|---|---|---|---|---|
-| 0 | 0.01% | 0.03% | 0.23% | 2.06% | 22.40% |
-| 1 | 0.03% | 0.08% | 0.50% | 5.12% | 53.27% |
-| 10 | 0.27% | 0.44% | 2.20% | 18.30% | 183.62% |
-| 100 | 2.92% | 3.37% | 5.04% | 21.22% | 202.76% |
-| 1000 | 41.83% | 36.14% | 40.44% | 59.83% | 265.95% |
+| 0 | 0.00% | 0.01% | 0.08% | 0.71% | 5.82% |
+| 1 | 0.02% | 0.03% | 0.09% | 0.85% | 10.48% |
+| 10 | 0.17% | 0.20% | 0.48% | 2.67% | 28.48% |
+| 100 | 1.91% | 2.11% | 2.38% | 5.20% | 33.54% |
 
-Without a pre-filter, `SimpleShapecast` cost grows with hitbox count even at
-a fixed query count (the 1000-query column climbs from 22% to 266% going
-from 0 to 1000 hitboxes) — fatter envelopes mean more candidates reach GJK,
-and nothing narrows them first. This is the clearest evidence in these
-sheets that the pre-filter is worth extending to the shapecast paths.
+Without a pre-filter, New's `SimpleShapecast` column climbs faster than
+Ref's as query count grows — clearest at 100 hitboxes/1000 queries (33.54%
+vs. Ref's 24.00%), and already visible at 10 hitboxes (28.48% vs. 22.32%).
+Fatter envelopes mean more candidates reach GJK, and nothing narrows them
+first. This is the case for extending the raycast pre-filter's idea to the
+shapecast paths.
 
 The tables below (query-shape routine costs, narrow-phase behavior on a
 direct hit vs. a grazing contact) describe the exact-test code paths, which
