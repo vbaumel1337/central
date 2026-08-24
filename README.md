@@ -257,23 +257,82 @@ only ever attack the other half.
 more thing: a union leaf's envelope can cover up to `UNION_SIZE` frames of
 sweep, so a tree candidate is a much weaker signal of relevance than it was
 with one leaf per frame, meaning more candidates now reach the expensive
-oriented test (`bolt.raycast.box`) per query. A cheap AABB pre-filter against
-each candidate's exact per-frame box (already computed as a byproduct of the
-union math, just reused) claws most of that back:
+oriented test (`bolt.raycast.box`/GJK) per query. A cheap AABB pre-filter
+against each candidate's exact per-frame box (already computed as a
+byproduct of the union math, just reused) claws most of that back for
+`Raycast`. It isn't implemented for `Shapecast`/`SimpleShapecast`/
+`QueryShape` yet (would need the same idea: a swept-AABB or shape-AABB test
+ahead of the GJK call), which shows in the sheets below.
 
-| hitboxes | ref (µs/call) | new, no pre-filter (µs/call) | new, with pre-filter (µs/call) |
-|---|---|---|---|
-| 100 | 1.13 | 2.53 | 2.14 |
-| 400 | 2.12 | 5.08 | 3.09 |
-| 1000 | 1.82 | 5.58 | 3.56 |
+**Whole-frame cost sheets**: each cell is `UpdateFrame` plus the stated
+number of queries that frame, as % of one Hz60 step (16667 µs), median of 7
+batches of 20 timed frames (median rather than mean specifically so one
+GC pause landing in a batch doesn't skew the cell — see
+`bench/Benchmark.luau`'s `measureBatched`). Row 0 hitboxes isolates query
+overhead against empty trees; column 0 queries isolates `UpdateFrame` alone.
+Generated with `bench/RunBenchmarkSheets.luau` — the design notes suggest a
+10000-hitbox row too, but that crashed a live Studio session in practice, so
+it's not included here; rerun with a larger `hitboxCounts` list in a
+disposable place if you want it. Cells still carry noticeable run-to-run
+variance at the high-query-count corner (a Studio Play session isn't a clean
+room), so read these as directional, like the rest of this section.
 
-The pre-filter is currently implemented for `Raycast` only — `Shapecast`/
-`SimpleShapecast`/`QueryShape` would need the same treatment (a swept-AABB or
-shape-AABB test ahead of the GJK call) to close the same gap, and don't have
-it yet. Whether `UpdateFrame`'s savings outweigh the raycast query cost
-depends on cast volume: net favorable up to roughly **750 raycasts/frame** at
-1000 hitboxes; past that, the query-side cost dominates. Most games are
-nowhere near that cast rate, but it's worth knowing the crossover exists.
+**Raycast**
+
+*Ref (pre-union-hitboxes):*
+
+| hitboxes | 0 | 1 | 10 | 100 | 1000 |
+|---|---|---|---|---|---|
+| 0 | 0.00% | 0.00% | 0.02% | 0.62% | 4.90% |
+| 1 | 0.02% | 0.03% | 0.10% | 0.75% | 6.77% |
+| 10 | 0.21% | 0.19% | 0.29% | 1.23% | 10.05% |
+| 100 | 2.33% | 2.33% | 2.40% | 3.30% | 12.03% |
+| 1000 | 27.68% | 27.42% | 27.37% | 28.47% | 40.79% |
+
+*New (union hitboxes, with the raycast pre-filter):*
+
+| hitboxes | 0 | 1 | 10 | 100 | 1000 |
+|---|---|---|---|---|---|
+| 0 | 0.01% | 0.03% | 0.21% | 1.85% | 18.81% |
+| 1 | 0.03% | 0.05% | 0.19% | 2.31% | 20.73% |
+| 10 | 0.28% | 0.33% | 0.85% | 5.76% | 43.04% |
+| 100 | 2.98% | 3.16% | 3.51% | 8.90% | 60.12% |
+| 1000 | 40.79% | 37.32% | 37.43% | 46.25% | 119.97% |
+
+At low-to-moderate query counts `UpdateFrame`'s savings win outright (the 0-
+and 1-query columns are New's `UpdateFrame` numbers, and they're lower than
+Ref's throughout). At high query counts New is behind Ref even at 0 hitboxes
+— the pre-filter itself (computing a ray/AABB test ahead of the exact test)
+has a small fixed per-call cost that Ref never pays, and it shows up once
+you're issuing hundreds of raycasts a frame.
+
+**SimpleShapecast** (no pre-filter yet — this is the gap a future pass would close)
+
+*Ref:*
+
+| hitboxes | 0 | 1 | 10 | 100 | 1000 |
+|---|---|---|---|---|---|
+| 0 | 0.00% | 0.00% | 0.03% | 0.59% | 5.85% |
+| 1 | 0.02% | 0.03% | 0.15% | 1.22% | 13.07% |
+| 10 | 0.19% | 0.21% | 0.45% | 2.23% | 21.13% |
+| 100 | 2.28% | 2.31% | 2.54% | 4.50% | 22.52% |
+| 1000 | 28.97% | 28.12% | 27.94% | 30.29% | 133.20% |
+
+*New:*
+
+| hitboxes | 0 | 1 | 10 | 100 | 1000 |
+|---|---|---|---|---|---|
+| 0 | 0.01% | 0.03% | 0.23% | 2.06% | 22.40% |
+| 1 | 0.03% | 0.08% | 0.50% | 5.12% | 53.27% |
+| 10 | 0.27% | 0.44% | 2.20% | 18.30% | 183.62% |
+| 100 | 2.92% | 3.37% | 5.04% | 21.22% | 202.76% |
+| 1000 | 41.83% | 36.14% | 40.44% | 59.83% | 265.95% |
+
+Without a pre-filter, `SimpleShapecast` cost grows with hitbox count even at
+a fixed query count (the 1000-query column climbs from 22% to 266% going
+from 0 to 1000 hitboxes) — fatter envelopes mean more candidates reach GJK,
+and nothing narrows them first. This is the clearest evidence in these
+sheets that the pre-filter is worth extending to the shapecast paths.
 
 The tables below (query-shape routine costs, narrow-phase behavior on a
 direct hit vs. a grazing contact) describe the exact-test code paths, which
