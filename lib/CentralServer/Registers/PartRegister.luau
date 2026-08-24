@@ -12,6 +12,10 @@ export type PartData = {
     cframe: CFrame | false,
     size: Vector3,
     canCollide: boolean,
+    -- world-space AABB, written by UnionRegister:UpdateFrame each frame the part is present.
+    -- Reused as-is by the query rejection cascade, so it's not recomputed there.
+    aabbMin: Vector3,
+    aabbMax: Vector3,
 }
 
 export type PartRegister = FrameRegister.FrameRegister<PartData> & typeof(setmetatable(
@@ -54,12 +58,16 @@ function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: Pa
             fd.cframe = false
             fd.size = part.Size
             fd.canCollide = part.CanCollide
+            fd.aabbMin = Vector3.zero
+            fd.aabbMax = Vector3.zero
         end
     else
         local defaultData: PartData = {
             cframe = false,
             size = part.Size,
             canCollide = part.CanCollide,
+            aabbMin = Vector3.zero,
+            aabbMax = Vector3.zero,
         }
 
         local config = {

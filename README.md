@@ -8,9 +8,12 @@ that raycasts/shapecasts issued against a player are resolved against where
 that player actually saw the world, not just the current frame. It measures
 each player's perceived replication delay automatically (see
 [How Character Latency Is Measured](#how-character-latency-is-measured)) and
-rewinds hitbox history to match. Queries are resolved against an AABB tree
-per historical frame, using the [Bolt](https://github.com/unityjaeger/Bolt)
-library for the collision-detection math.
+rewinds hitbox history to match. History frames are grouped into blocks, each
+backed by one AABB tree whose leaves are the *union* of a part's boxes across
+the block (see [Union Hitboxes](#union-hitboxes)); the exact per-frame box is
+still what every query is ultimately resolved against, using the
+[Bolt](https://github.com/unityjaeger/Bolt) library for the collision-detection
+math.
 
 ## Installation
 
@@ -194,26 +197,100 @@ it but doesn't independently verify it, so a modified client can influence
 how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
 `MAX_LATENCY` as the security-relevant knob if that matters for your game.
 
+## Union Hitboxes
+
+`FRAME_CAP` history frames aren't each backed by their own AABB tree anymore.
+They're grouped into `UNIONS_PER_PART` blocks of `UNION_SIZE` frames
+(defaults: 5 × 16 = 80), each with one tree whose leaves are the *union* of a
+part's boxes across the whole block, padded and (for a moving part)
+extrapolated a little ahead using its previous block's measured sweep. A
+query still resolves against the exact per-frame box — the union tree only
+decides which parts are worth checking at all.
+
+The old one-tree-per-frame design meant every tracked part paid for a full
+`remove_leaf` + `insert_leaf` on **every** history frame: Bolt's tree has a
+fast path that skips that work when a part's motion stays inside its previous
+padded bounds, but a moving part almost never does across a single frame, so
+the fast path essentially never fired. Grouping frames into blocks means only
+the currently-active block's tree is touched per frame, and the padding
+actually gets a chance to absorb a frame or two of motion before a leaf needs
+rewriting.
+
+`MAX_LATENCY` (the security-relevant rewind-distance knob, see
+[above](#how-character-latency-is-measured)) is now also clamped to a derived
+`LATENCY_CEILING`: the block currently being refilled holds a mix of fresh and
+~`FRAME_CAP`-frame-stale data, so it's kept out of query range, capping how far
+back a rewind can reach to `(UNIONS_PER_PART - 1) * UNION_SIZE` frames. At
+defaults that's ~1.067s — above the authored `MAX_LATENCY` default of 1s, so
+out-of-the-box behavior is unchanged. `MAX_LATENCY` can still lower the
+effective cap; it can no longer author a value the ring can't honor, and
+`CharacterLatency.Start` warns once at startup if it tries to.
+
 ## Performance
 
-Measured server-side in Studio: a 3×3×3 grid of anchored hitbox parts
-(7 studs apart), all moved and all 60 history frames populated every frame,
-at default settings (`FRAME_CAP = 60`, frame ranges of `1`,
-`PREFER_NEAREST_FRAME = true`). Timed against `HistoricalHitboxes` directly,
-lag-compensation cost alone; `Central.Raycast`/friends add a live
-`workspace` cast on top. Absolute numbers will move with hardware; the
-scaling behavior is the part worth trusting.
+Measured server-side in a Studio Play session: a grid of anchored hitbox
+parts (7 studs apart), all moved every frame, at default settings
+(`FRAME_CAP = 80`, `UNION_SIZE = 16`, `UNIONS_PER_PART = 5`, frame range `1`,
+`PREFER_NEAREST_FRAME = true`), compared against `HistoricalHitboxesRef` — the
+pre-union-hitboxes implementation, kept frozen for exactly this comparison
+(see `tests/DifferentialHarness.luau`, `bench/Benchmark.luau`). A Studio Play
+session has more overhead than a packaged dedicated server, so treat absolute
+numbers as directional; the ratios between old and new are what to trust.
+Absolute numbers will also move with hardware.
 
-**Closest-hit queries are flat in hitbox count**: 16× the hitboxes costs
-the same, because the tree prunes to the closest hit during traversal:
+**`UpdateFrame`** (the cost this redesign targets, paid once per simulation
+step regardless of querying) drops 25–40%:
 
-| hitboxes | `Raycast` | `Shapecast` | `SimpleShapecast` | Overlap (per part) |
-|---|---|---|---|---|
-| 50 | 0.94 µs | 1.35 µs | 1.23 µs | 50.3 µs (1.05 µs) |
-| 400 | 1.01 µs | 1.51 µs | 1.40 µs | 70.8 µs (1.11 µs) |
-| 800 | 1.03 µs | 1.42 µs | 1.37 µs | 70.1 µs (1.10 µs) |
+| hitboxes | ref (µs/hitbox) | new (µs/hitbox) | speedup |
+|---|---|---|---|
+| 100 | 3.71 | 2.82 | 1.32× |
+| 400 | 4.13 | 2.98 | 1.39× |
+| 1000 | 4.60 | 3.28 | 1.40× |
 
-What actually moves the cost: **whether the cast connects** (400 hitboxes).
+That's a real win, but smaller than the naive "every frame pays for a tree
+op that should almost never fire" framing suggests: property reads
+(`part.CFrame`/`part.CanCollide`, unavoidable by any tree design) are roughly
+half of `UpdateFrame`'s cost, not the tree operations, so the redesign can
+only ever attack the other half.
+
+**Raycast query cost** gets measurably *worse* before accounting for one
+more thing: a union leaf's envelope can cover up to `UNION_SIZE` frames of
+sweep, so a tree candidate is a much weaker signal of relevance than it was
+with one leaf per frame, meaning more candidates now reach the expensive
+oriented test (`bolt.raycast.box`) per query. A cheap AABB pre-filter against
+each candidate's exact per-frame box (already computed as a byproduct of the
+union math, just reused) claws most of that back:
+
+| hitboxes | ref (µs/call) | new, no pre-filter (µs/call) | new, with pre-filter (µs/call) |
+|---|---|---|---|
+| 100 | 1.13 | 2.53 | 2.14 |
+| 400 | 2.12 | 5.08 | 3.09 |
+| 1000 | 1.82 | 5.58 | 3.56 |
+
+The pre-filter is currently implemented for `Raycast` only — `Shapecast`/
+`SimpleShapecast`/`QueryShape` would need the same treatment (a swept-AABB or
+shape-AABB test ahead of the GJK call) to close the same gap, and don't have
+it yet. Whether `UpdateFrame`'s savings outweigh the raycast query cost
+depends on cast volume: net favorable up to roughly **750 raycasts/frame** at
+1000 hitboxes; past that, the query-side cost dominates. Most games are
+nowhere near that cast rate, but it's worth knowing the crossover exists.
+
+The tables below (query-shape routine costs, narrow-phase behavior on a
+direct hit vs. a grazing contact) describe the exact-test code paths, which
+this redesign didn't touch, so they're carried over unchanged from the
+pre-union-hitboxes measurement:
+
+**Closest-hit queries used to be flat in hitbox count** — 16× the hitboxes
+cost the same, because the tree pruned to the closest hit during traversal.
+That still roughly holds for `HistoricalHitboxesRef`; for the union-tree
+implementation it's now closer to flat-with-a-slope (see the raycast table
+above) — fatter envelopes mean the traversal prunes less aggressively as the
+candidate count grows, even with the pre-filter in front of the exact test.
+
+What actually moves the cost within a single query: **whether the cast
+connects** (400 hitboxes, narrow-phase-only — this table predates the
+union-tree change and the exact-test code paths it measures are unchanged by
+it).
 A clean hit bounds the search so everything farther is skipped; a grazing
 shapecast never establishes that bound, so every candidate gets tested
 (~10× a direct hit):
@@ -241,48 +318,12 @@ Cylinder/Wedge/mesh part drops to GJK, approximate with the other two on a
 hot path if the exact silhouette doesn't matter. Overlap cost overall tracks
 how many hitboxes fall *inside* the query volume, not how many exist.
 
-**Per frame**: median of 600 timed frames, each covering `UpdateFrame` plus
-the stated number of queries, measured in place (so it includes the cache
-pressure a query pays right after `UpdateFrame` just walked the whole tree;
-a query timed alone in a tight loop looks 1.5–2× cheaper than this).
-
-`UpdateFrame` runs once per simulation step regardless of querying, and is
-roughly linear in hitbox count:
-
-| hitboxes | per frame | per hitbox |
-|---|---|---|
-| 50 | 69 µs | 1.38 µs |
-| 100 | 156 µs | 1.56 µs |
-| 200 | 364 µs | 1.82 µs |
-| 400 | 778 µs | 1.95 µs |
-| 800 | 1730 µs | 2.16 µs |
-
-Whole frame with raycasts, as a share of one 60 Hz frame (16667 µs):
-
-| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
-|---|---|---|---|---|---|---|---|
-| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.6% | 0.8% | 1.3% |
-| 100 | 0.9% | 1.0% | 1.1% | 1.2% | 1.3% | 1.6% | 1.9% |
-| 200 | 2.2% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.3% |
-| 400 | 4.7% | 5.0% | 5.1% | 5.0% | 5.2% | 5.5% | 6.1% |
-| 800 | 10.4% | 10.8% | 11.6% | 11.0% | 11.7% | 11.7% | 13.2% |
-
-Shapecasts land within noise of those raycast figures at every count; the
-per-cast difference is small enough that `UpdateFrame` dominates either way:
-
-| hitboxes | 0 casts | 1 | 5 | 10 | 25 | 50 | 100 |
-|---|---|---|---|---|---|---|---|
-| 50 | 0.4% | 0.4% | 0.5% | 0.5% | 0.7% | 0.9% | 1.5% |
-| 100 | 1.0% | 1.0% | 1.1% | 1.1% | 1.3% | 1.6% | 2.1% |
-| 200 | 2.1% | 2.3% | 2.3% | 2.3% | 2.5% | 2.8% | 3.4% |
-| 400 | 4.7% | 4.9% | 4.9% | 5.1% | 5.1% | 5.4% | 6.0% |
-| 800 | 11.1% | 11.1% | 11.2% | 11.7% | 11.1% | 11.9% | 12.8% |
-
-If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG`,
-adding query volume is comparatively cheap. (One caveat on the medians: a
-historical tree occasionally rebuilds (`TREE_REBUILD_CHECK_INTERVAL`) and
-that frame spikes; rare and staggered across trees, so it shows up in the
-tail, not the median.)
+If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG` —
+adding query volume is comparatively cheap, per the raycast crossover point
+above. (One caveat: a historical tree occasionally rebuilds, now triggered by
+its block sealing rather than a wall-clock timer — see
+[Union Hitboxes](#union-hitboxes); rare and staggered across trees by
+construction, so it shows up in the tail, not the median.)
 
 ## Settings
 
@@ -306,15 +347,19 @@ runtime, is the safe way to change a default.
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
-| `FRAME_CAP` | `60` | Size of the history ring buffer; bounds how far back Central can rewind (60 @ 60 Hz ≈ 1s). |
+| `UNION_SIZE` | `16` | History frames per union block. |
+| `UNIONS_PER_PART` | `5` | Number of block trees kept per part. |
+| `FRAME_CAP` | *derived* = `UNIONS_PER_PART * UNION_SIZE` (`80`) | Size of the history ring buffer; not directly editable — tune `UNION_SIZE`/`UNIONS_PER_PART` instead. |
+| `LATENCY_CEILING` | *derived* ≈ `1.067s` | What the ring can actually service; see [Union Hitboxes](#union-hitboxes). `MAX_LATENCY` is clamped to this. |
+| `UNION_PADDING` | `1` | Padding (studs) baked into each union leaf's bounds, replacing the old `AABB_PADDING`. Per-part and runtime-tunable, unlike a tree's own padding. |
+| `UNION_PREDICTION_FRAMES` | `16` | Caps how many frames of velocity-extrapolation inflation a block's envelope gets, so one teleport frame can't poison the next block. |
+| `UNION_UPDATE_FRACTION` | `0.5` | A leaf is shrunk back to tight bounds once its volume exceeds this multiple of what the current block actually needs. |
 | `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Raycast`. |
 | `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
 | `PREFER_NEAREST_FRAME` | `true` | Tie-break when several frames in range produce a hit: `true` = nearest frame wins regardless of distance; `false` = spatially closest wins, ties to nearer frame. |
-| `TREE_REBUILD_CHECK_INTERVAL` | `10` | Seconds between balance checks on each historical AABB tree. |
-| `TREE_REBUILD_CHECK_JITTER` | `0.2` | Fraction of the interval used to randomize each tree's next check, so they don't all come due together. |
 | `LATENCY_OFFSET` | `0` | Seconds added to each raw latency sample before clamp/average; bias compensation earlier/later. |
 | `LATENCY_SAMPLE_WINDOW` | `5` | How many recent client reports are averaged into `LATENCY_ATTRIBUTE`. |
-| `MAX_LATENCY` | `1` | Upper clamp (s) on a reported latency sample; also bounds how far a modified client can push its own rewind. |
+| `MAX_LATENCY` | `1` | Upper clamp (s) on a reported latency sample, itself clamped to `LATENCY_CEILING`; bounds how far a modified client can push its own rewind. |
 | `LATENCY_DUMMY_HIDE_OFFSET` | `Vector3.new(0, 13337, 0)` | Where the latency measurement rig is parked, off-map. |
 | `LATENCY_ORBIT_RADIUS` | `25` | Radius (studs) of the circle the two latency dummies walk. |
 | `LATENCY_ANGLE_EPSILON` | `math.rad(0.1)` | How close the delayed dummy must get to the predicted dummy's recorded angle to count as caught up. |
@@ -322,7 +367,7 @@ runtime, is the safe way to change a default.
 | `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds between measurement cycles. |
 | `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a flush hitbox still registers. |
 | `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
-| `AABB_PADDING` | `1` | Padding (studs) around each hitbox's bounding box in the AABB tree, giving queries slack before a partial rebuild is needed. |
+| `TREE_REBUILD_CHECK_INTERVAL`, `TREE_REBUILD_CHECK_JITTER` | `10`, `0.2` | Legacy, test-only — only the frozen `HistoricalHitboxesRef` reference implementation still reads these. Production trees rebuild off block seals instead; see [Union Hitboxes](#union-hitboxes). |
 
 ## Third-party code
 

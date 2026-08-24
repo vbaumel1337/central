@@ -49,6 +49,13 @@ function TimeRegister.GetIndexAtTime(self: TimeRegister, t: number): number?
 			return searchIndex
 		end
 
+		if i == self.frameCap then
+			-- t predates every recorded frame (latency exceeds the ring's depth). Clamp to
+			-- the oldest frame instead of falling through to nil, which callers otherwise
+			-- treat as "no rewind" -- exactly backwards for a player at maximum latency.
+			return searchIndex
+		end
+
 		newerIndex = searchIndex
 		searchIndex -= 1
 		if searchIndex < 1 then

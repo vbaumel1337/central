@@ -4,7 +4,6 @@
 local bolt = require(script.Parent.Parent.bolt)
 local Settings = require(script.Parent.Parent.Settings)
 local PartRegister = require(script.Parent.Registers.PartRegister)
-local UnionRegister = require(script.Parent.Registers.UnionRegister)
 local CollisionCache = require(script.Parent.CollisionCache)
 
 local gjk = bolt.dispatch.gjk
@@ -13,34 +12,17 @@ local shapeMap = require(script.Parent.Parent.bolt.shape_map)
 
 local GJK_TOLERANCE = Settings.GJK_TOLERANCE
 local PREFER_NEAREST_FRAME = Settings.PREFER_NEAREST_FRAME
+local TREE_REBUILD_CHECK_INTERVAL = Settings.TREE_REBUILD_CHECK_INTERVAL
+local TREE_REBUILD_CHECK_JITTER = Settings.TREE_REBUILD_CHECK_INTERVAL * Settings.TREE_REBUILD_CHECK_JITTER
 
-local NEG_INF_VEC = -vector.one * math.huge
-local POS_INF_VEC = vector.one * math.huge
+--own generator, so staggering the trees never disturbs the global math.random sequence
+local rng = Random.new()
 
 --the closest-hit tree queries work in fractions of the cast, not studs, so narrow phase
 --distances get scaled by this. a zero length sweep collapses every hit onto fraction 0.
 local function fractionScale(direction: Vector3): number
 	local length = direction.Magnitude
 	return if length > 0 then 1 / length else 0
-end
-
--- ray-vs-AABB slab test (same idiom as Bolt's own private ray_aabb/swept_aabb_enter in
--- aabb_tree.luau -- reimplemented rather than called, since it isn't part of Bolt's public API
--- and lib/bolt/ isn't patched). Used as a cheap pre-filter in front of the oriented exact test:
--- a union leaf's envelope can cover up to UNION_SIZE frames of sweep, so a tree candidate is a
--- much weaker signal of relevance than it was with one leaf per frame, and this is what keeps
--- query cost from scaling with how fat the leaves are.
-local function rayAABB(rayOrigin: Vector3, rayInvDir: Vector3, min: Vector3, max: Vector3, maxFraction: number): boolean
-	local t1 = vector.max(NEG_INF_VEC, (min - rayOrigin) * rayInvDir)
-	local t2 = vector.min(POS_INF_VEC, (max - rayOrigin) * rayInvDir)
-
-	local tMin = vector.min(t1, t2)
-	local tMax = vector.max(t1, t2)
-
-	local tmin = math.max(0, tMin.X, tMin.Y, tMin.Z)
-	local tmax = math.min(maxFraction, tMax.X, tMax.Y, tMax.Z)
-
-	return tmin <= tmax
 end
 
 export type Hitbox = {
@@ -54,10 +36,6 @@ export type Hitbox = {
 	canCollide: boolean,
 	frameOffset: number,
 	active: boolean,
-	-- tight per-frame world AABB; a byproduct UnionRegister already computes for the union math,
-	-- reused here as the query rejection cascade's pre-filter ahead of the oriented exact test
-	aabbMin: Vector3,
-	aabbMax: Vector3,
 }
 
 type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number}
@@ -68,11 +46,10 @@ HistoricalHitboxes.__index = HistoricalHitboxes
 export type HistoricalHitboxes = typeof(setmetatable(
 	{} :: {
 		frameCap: number,
-		unionSize: number,
-		unionsPerPart: number,
+		padding: number,
 		trees: {[number]: bolt.DynamicTree},
-		unions: UnionRegister.UnionRegister,
-		hitboxes: {[number]: {[number]: Hitbox}}, -- [partId][frame]
+		nextRebuildCheck: {[number]: number},
+		hitboxes: {[number]: {[number]: Hitbox}},
 		parts: {[BasePart]: PartInfo},
 		partList: {PartInfo},
 		nextPartId: number,
@@ -93,11 +70,6 @@ local DEFAULT_GROUP = Settings.DEFAULT_HITBOX_QUERY_GROUP
 
 local function wrapIndex(index: number, frameCap: number): number
 	return ((index - 1) % frameCap) + 1
-end
-
--- 1-indexed frame -> 1-indexed block. UNION_SIZE frames per block.
-local function blockOf(index: number, unionSize: number): number
-	return ((index - 1) // unionSize) + 1
 end
 
 local function isFilteredOut(hitbox: Hitbox, params: (RaycastParams | OverlapParams)?): boolean
@@ -136,23 +108,23 @@ local function isFilteredOut(hitbox: Hitbox, params: (RaycastParams | OverlapPar
 	return false
 end
 
-function HistoricalHitboxes.new(unionsPerPart: number, unionSize: number, padding: number, predictionFrames: number, updateFraction: number): HistoricalHitboxes
+function HistoricalHitboxes.new(frameCap: number, padding: number): HistoricalHitboxes
 	local self = setmetatable({}, HistoricalHitboxes) :: HistoricalHitboxes
-	self.unionsPerPart = unionsPerPart
-	self.unionSize = unionSize
-	self.frameCap = unionsPerPart * unionSize
+	self.frameCap = frameCap
+	self.padding = padding
 	self.trees = {}
+	self.nextRebuildCheck = {}
 	self.hitboxes = {}
 	self.parts = {}
 	self.partList = {}
 	self.nextPartId = 0
-	self.unions = UnionRegister.new(unionsPerPart, unionSize, padding, predictionFrames, updateFraction)
 
-	for block = 1, unionsPerPart do
-		-- aabb_padding = 0: padding is folded into each leaf's half_extents by UnionRegister's
-		-- writeLeaf instead, which (unlike the tree's own padding, frozen at construction) can
-		-- vary per part and be re-tuned at runtime
-		self.trees[block] = bolt.aabb_tree.new({aabb_padding = 0})
+	local now = os.clock()
+	for index = 1, frameCap do
+		self.trees[index] = bolt.aabb_tree.new({aabb_padding = padding})
+		self.hitboxes[index] = {}
+		--first check is spread evenly across the interval so the trees don't all come due together
+		self.nextRebuildCheck[index] = now + TREE_REBUILD_CHECK_INTERVAL * (index - 1) / frameCap
 	end
 
 	return self
@@ -165,12 +137,9 @@ function HistoricalHitboxes.AddPart(self: HistoricalHitboxes, register: PartRegi
 	end
 
 	self.nextPartId += 1
-	local id = self.nextPartId
-	local info: PartInfo = {id = id, part = part, register = register, listIndex = #self.partList + 1}
+	local info: PartInfo = {id = self.nextPartId, part = part, register = register, listIndex = #self.partList + 1}
 	self.parts[part] = info
 	table.insert(self.partList, info)
-	self.hitboxes[id] = {}
-	self.unions:AddPart(id)
 end
 
 function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
@@ -179,11 +148,13 @@ function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
 		return
 	end
 
-	self.hitboxes[info.id] = nil
-	for block = 1, self.unionsPerPart do
-		self.trees[block]:remove(info.id)
+	for index = 1, self.frameCap do
+		local hitbox = self.hitboxes[index][info.id]
+		if hitbox then
+			self.trees[index]:remove(info.id)
+			self.hitboxes[index][info.id] = nil
+		end
 	end
-	self.unions:RemovePart(info.id)
 
 	local lastIndex = #self.partList
 	local listIndex = info.listIndex
@@ -198,32 +169,23 @@ function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
 end
 
 function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
-	local unionSize = self.unionSize
-	local block = blockOf(index, unionSize)
-	local slot = (index - 1) % unionSize
-	local tree = self.trees[block]
+	local tree = self.trees[index]
+	local frameHitboxes = self.hitboxes[index]
 
-	-- steps info.register:Step() for every part, and maintains the union/envelope/tree state
-	self.unions:UpdateFrame(index, block, slot, tree, self.partList)
-
-	-- build/update the exact per-frame Hitbox record. Uses info.register:AtIndex(index), the
-	-- same data UnionRegister just stepped -- Step() must run exactly once per part per frame,
-	-- so this reads it rather than stepping again.
-	local hitboxesById = self.hitboxes
 	for _, info in self.partList do
+		info.register:Step()
 		local data = info.register:AtIndex(index)
-		local byFrame = hitboxesById[info.id]
-		local hitbox = byFrame[index]
-
+		local hitbox = frameHitboxes[info.id]
 		if not data.cframe then
 			if hitbox then
-				byFrame[index] = nil
+				tree:remove(info.id)
+				frameHitboxes[info.id] = nil
 			end
 			continue
 		end
 
 		if not hitbox then
-			byFrame[index] = {
+			local newHitbox: Hitbox = {
 				id = info.id,
 				cframe = data.cframe,
 				shape = bolt.create_box(data.size),
@@ -234,34 +196,37 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 				canCollide = data.canCollide,
 				frameOffset = 0,
 				active = true,
-				aabbMin = data.aabbMin,
-				aabbMax = data.aabbMax,
 			}
+			frameHitboxes[info.id] = newHitbox
+			tree:insert(info.id, newHitbox.cframe, newHitbox.shape)
 		else
 			if data.size ~= hitbox.size then
 				hitbox.size = data.size
 				hitbox.shape = bolt.create_box(data.size)
+				tree:resize(info.id, hitbox.shape)
 			end
 			hitbox.cframe = data.cframe
 			hitbox.canCollide = data.canCollide
-			hitbox.aabbMin = data.aabbMin
-			hitbox.aabbMax = data.aabbMax
+			tree:move(info.id, hitbox.cframe)
 		end
 	end
 
-	if slot == unionSize - 1 then
-		self.unions:Seal(block, tree, self.partList)
+	--should_rebuild is a full scan over the tree's nodes, so each tree only checks on its own
+	--schedule. the jitter keeps the trees from drifting into checking on the same frame.
+	local now = os.clock()
+	if now >= self.nextRebuildCheck[index] then
+		self.nextRebuildCheck[index] = now + TREE_REBUILD_CHECK_INTERVAL
+			+ rng:NextNumber(-TREE_REBUILD_CHECK_JITTER, TREE_REBUILD_CHECK_JITTER)
+
+		if tree:should_rebuild() then
+			tree:partial_rebuild()
+		end
 	end
 end
 
 function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, rayOrigin: Vector3, rayDirection: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (Hitbox?, Vector3?, number?, Vector3?)
 	local playerName = player.Name
 	local invLength = fractionScale(rayDirection)
-	local frameCap, unionSize = self.frameCap, self.unionSize
-	local hitboxesById = self.hitboxes
-	-- 1/0 is +-inf in Luau floats, not an error, so an axis-aligned ray is handled the same
-	-- way rayAABB's own inf clamps handle it
-	local rayInvDir = Vector3.new(1 / rayDirection.X, 1 / rayDirection.Y, 1 / rayDirection.Z)
 
 	local bestDistance = math.huge
 	local bestHitbox: Hitbox? = nil
@@ -270,21 +235,14 @@ function HistoricalHitboxes.QueryRaycast(self: HistoricalHitboxes, player: Playe
 	local bestOffset = 0
 
 	local function queryFrame(offset: number)
-		local index = wrapIndex(centerIndex + offset, frameCap)
+		local index = wrapIndex(centerIndex + offset, self.frameCap)
+		local frameHitboxes = self.hitboxes[index]
 		--anything the cast reaches after the current best is pruned before its narrow phase runs
 		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-		self.trees[blockOf(index, unionSize)]:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
-			local byFrame = hitboxesById[id]
-			local hitbox = byFrame and byFrame[index]
+		self.trees[index]:query_ray_closest(rayOrigin, rayDirection, function(id: number): number?
+			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
-				return nil
-			end
-
-			-- rejection cascade step 3: a union leaf's envelope can span up to UNION_SIZE frames,
-			-- so most tree candidates only clip the fat envelope, not this exact frame's tight
-			-- box. Reject those before paying for the oriented test below.
-			if not rayAABB(rayOrigin, rayInvDir, hitbox.aabbMin, hitbox.aabbMax, math.huge) then
 				return nil
 			end
 
@@ -337,8 +295,6 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 
 	local playerName = player.Name
 	local invLength = fractionScale(direction)
-	local frameCap, unionSize = self.frameCap, self.unionSize
-	local hitboxesById = self.hitboxes
 
 	local bestDistance = math.huge
 	local bestHitbox: Hitbox? = nil
@@ -347,12 +303,12 @@ function HistoricalHitboxes.QueryShapecast(self: HistoricalHitboxes, player: Pla
 	local bestOffset = 0
 
 	local function queryFrame(offset: number)
-		local index = wrapIndex(centerIndex + offset, frameCap)
+		local index = wrapIndex(centerIndex + offset, self.frameCap)
+		local frameHitboxes = self.hitboxes[index]
 		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-		self.trees[blockOf(index, unionSize)]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
-			local byFrame = hitboxesById[id]
-			local hitbox = byFrame and byFrame[index]
+		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
+			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
 				return nil
 			end
@@ -404,20 +360,18 @@ function HistoricalHitboxes.QuerySimpleShapecast(self: HistoricalHitboxes, playe
 
 	local playerName = player.Name
 	local invLength = fractionScale(direction)
-	local frameCap, unionSize = self.frameCap, self.unionSize
-	local hitboxesById = self.hitboxes
 
 	local bestDistance = math.huge
 	local bestHitbox: Hitbox? = nil
 	local bestOffset = 0
 
 	local function queryFrame(offset: number)
-		local index = wrapIndex(centerIndex + offset, frameCap)
+		local index = wrapIndex(centerIndex + offset, self.frameCap)
+		local frameHitboxes = self.hitboxes[index]
 		local maxFraction = if bestDistance < math.huge then bestDistance * invLength else nil
 
-		self.trees[blockOf(index, unionSize)]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
-			local byFrame = hitboxesById[id]
-			local hitbox = byFrame and byFrame[index]
+		self.trees[index]:query_shapecast_closest(shape, cframe, direction, function(id: number): number?
+			local hitbox = frameHitboxes[id]
 			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) then
 				return nil
 			end
@@ -479,52 +433,16 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 	local maxParts = (params and params.MaxParts) or math.huge
 	maxParts = if maxParts <= 0 then math.huge else maxParts
 
-	-- group the requested offsets by which block their frame falls in, so a block whose tree
-	-- covers several requested offsets is walked exactly once (not once per offset). This is why
-	-- MaxParts truncation order can differ from the old per-frame implementation: the *set* of
-	-- candidates is the same, only the order results accumulate in has changed.
-	local offsetsByBlock: {[number]: {{offset: number, index: number}}} = {}
-	local blockOrder: {number} = {}
 	for offset = -frameRange, frameRange do
 		local index = wrapIndex(centerIndex + offset, self.frameCap)
-		local block = blockOf(index, self.unionSize)
-		local list = offsetsByBlock[block]
-		if not list then
-			list = {}
-			offsetsByBlock[block] = list
-			table.insert(blockOrder, block)
-		end
-		table.insert(list, {offset = offset, index = index})
-	end
-
-	for _, block in blockOrder do
-		local frames = offsetsByBlock[block]
-		for _, id in self.trees[block]:query_shape(cframe, shape) do
-			local byFrame = self.hitboxes[id]
-			if not byFrame then
+		local frameHitboxes = self.hitboxes[index]
+		for _, id in self.trees[index]:query_shape(cframe, shape) do
+			local hitbox = frameHitboxes[id]
+			if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) or not collides(hitbox, cframe, shape) then
 				continue
 			end
 
-			-- this candidate's leaf covers every frame in the block; keep whichever requested
-			-- offset for this id is nearest to centerIndex among the ones that actually collide
-			local best: Hitbox? = nil
-			local bestOffset = 0
-			for _, entry in frames do
-				local hitbox = byFrame[entry.index]
-				if not hitbox or hitbox.owner == playerName or isFilteredOut(hitbox, params) or (check and not check(hitbox.instance)) or not collides(hitbox, cframe, shape) then
-					continue
-				end
-				if not best or math.abs(entry.offset) < math.abs(bestOffset) then
-					best = hitbox
-					bestOffset = entry.offset
-				end
-			end
-
-			if not best then
-				continue
-			end
-
-			local previous = results[best.instance]
+			local previous = results[hitbox.instance]
 			if not previous then
 				if partCount >= maxParts then
 					continue
@@ -532,24 +450,21 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 				partCount += 1
 			end
 
-			if not previous or math.abs(bestOffset) < math.abs(previous.frameOffset) then
-				local resultHitbox = table.clone(best)
-				resultHitbox.frameOffset = bestOffset
-				results[best.instance] = resultHitbox
+			if not previous or math.abs(offset) < math.abs(previous.frameOffset) then
+				local resultHitbox = table.clone(hitbox)
+				resultHitbox.frameOffset = offset
+				results[hitbox.instance] = resultHitbox
 			end
 		end
 	end
-
 	return results
 end
 
 function HistoricalHitboxes.GetHitboxesForOwner(self: HistoricalHitboxes, index: number, ownerName: string): {Hitbox}
-	local wrapped = wrapIndex(index, self.frameCap)
+	local frameHitboxes = self.hitboxes[wrapIndex(index, self.frameCap)]
 	local results: {Hitbox} = {}
-	for _, info in self.partList do
-		local byFrame = self.hitboxes[info.id]
-		local hitbox = byFrame and byFrame[wrapped]
-		if hitbox and hitbox.owner == ownerName then
+	for _, hitbox in frameHitboxes do
+		if hitbox.owner == ownerName then
 			table.insert(results, hitbox)
 		end
 	end
@@ -557,10 +472,10 @@ function HistoricalHitboxes.GetHitboxesForOwner(self: HistoricalHitboxes, index:
 end
 
 function HistoricalHitboxes.Destroy(self: HistoricalHitboxes)
-	for block = 1, self.unionsPerPart do
-		self.trees[block]:clear()
+	for index = 1, self.frameCap do
+		self.trees[index]:clear()
+		table.clear(self.hitboxes[index])
 	end
-	table.clear(self.hitboxes)
 	table.clear(self.parts)
 	table.clear(self.partList)
 end

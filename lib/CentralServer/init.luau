@@ -11,6 +11,7 @@ local Observers = require(script.Parent.Parent.Observers)
 local HistoricalHitboxes = require(script.HistoricalHitboxes)
 local PartRegister = require(script.Registers.PartRegister)
 local Settings = require(script.Parent.Settings)
+local CollisionCache = require(script.CollisionCache)
 export type Hitbox = HistoricalHitboxes.Hitbox
 
 local bolt = require(script.Parent.bolt)
@@ -37,6 +38,7 @@ function CentralServer.AddQueryGroup(name: string)
 		PhysicsService:CollisionGroupSetCollidable(hitboxGroup, name, false)
 	end
 	table.insert(QUERY_GROUPS, name)
+	CollisionCache.Invalidate()
 end
 
 function CentralServer.RemoveQueryGroup(name: string)
@@ -49,6 +51,7 @@ function CentralServer.RemoveQueryGroup(name: string)
 		PhysicsService:CollisionGroupSetCollidable(hitboxGroup, name, true)
 	end
 	table.remove(QUERY_GROUPS, index)
+	CollisionCache.Invalidate()
 end
 
 function CentralServer.IsQueryGroup(name: string): boolean
@@ -67,6 +70,7 @@ function CentralServer.AddCollisionGroup(name: string)
 		PhysicsService:CollisionGroupSetCollidable(name, queryGroup, false)
 	end
 	table.insert(HITBOX_GROUPS, name)
+	CollisionCache.Invalidate()
 end
 
 function CentralServer.RemoveCollisionGroup(name: string)
@@ -79,12 +83,19 @@ function CentralServer.RemoveCollisionGroup(name: string)
 		PhysicsService:CollisionGroupSetCollidable(name, queryGroup, true)
 	end
 	table.remove(HITBOX_GROUPS, index)
+	CollisionCache.Invalidate()
 end
 
 local GlobalTimeRegister = TimeRegister.new(FRAME_CAP, 0)
 --local CharacterRegisters = {} :: {[Player]: CharacterRegister.CharacterRegister}
 local PartRegisters = {} :: {[BasePart]:PartRegister.PartRegister}
-local HistoricalIndex = HistoricalHitboxes.new(FRAME_CAP, Settings.AABB_PADDING)
+local HistoricalIndex = HistoricalHitboxes.new(
+	Settings.UNIONS_PER_PART,
+	Settings.UNION_SIZE,
+	Settings.UNION_PADDING,
+	Settings.UNION_PREDICTION_FRAMES,
+	Settings.UNION_UPDATE_FRACTION
+)
 
 local RegistersPending:{PartRegister.PartRegister} = {}
 

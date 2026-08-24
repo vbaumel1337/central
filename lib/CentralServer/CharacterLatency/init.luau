@@ -47,7 +47,20 @@ function CharacterLatency.Start()
 	local LATENCY_ATTRIBUTE = Settings.LATENCY_ATTRIBUTE
 	local LATENCY_OFFSET = Settings.LATENCY_OFFSET
 	local MAX_LATENCY = Settings.MAX_LATENCY
+	local LATENCY_CEILING = Settings.LATENCY_CEILING
 	local LATENCY_SAMPLE_WINDOW = Settings.LATENCY_SAMPLE_WINDOW
+
+	-- MAX_LATENCY is the authored, security-relevant knob (see README); LATENCY_CEILING is what
+	-- the history ring can actually service. MAX_LATENCY can only ever lower the effective value,
+	-- never raise it past what the ring supports.
+	local EFFECTIVE_MAX_LATENCY = math.min(MAX_LATENCY, LATENCY_CEILING)
+	if MAX_LATENCY > LATENCY_CEILING then
+		warn(string.format(
+			"Central: Settings.MAX_LATENCY (%.3fs) exceeds LATENCY_CEILING (%.3fs); rewind is capped at %.3fs. "
+				.. "Lower MAX_LATENCY, or raise UNIONS_PER_PART/UNION_SIZE, to silence this.",
+			MAX_LATENCY, LATENCY_CEILING, EFFECTIVE_MAX_LATENCY
+		))
+	end
 
 	local latencySamples = {} :: {[Player]: {number}}
 
@@ -81,7 +94,7 @@ function CharacterLatency.Start()
 			return
 		end
 
-		local sample = math.clamp(elapsed + LATENCY_OFFSET, 0, MAX_LATENCY)
+		local sample = math.clamp(elapsed + LATENCY_OFFSET, 0, EFFECTIVE_MAX_LATENCY)
 
 		local samples = latencySamples[player]
 		if not samples then
