@@ -4,20 +4,22 @@ local DEFAULT_HITBOX_QUERY_GROUP = "HitboxQuery"
 
 local StepFrequency = Enum.StepFrequency.Hz60
 
--- Union hitboxes: history frames are grouped into blocks, one Bolt tree per block, whose leaves
--- are the union of a part's boxes over the block. UNION_SIZE frames per block, UNIONS_PER_PART
--- block trees -- see central/README.md's "Union Hitboxes" section for the full design.
-local UNION_SIZE = 16
-local UNIONS_PER_PART = 5
-local FRAME_CAP = UNIONS_PER_PART * UNION_SIZE -- derived: size of the history ring buffer
+-- Depth of the hitbox history ring, in simulation frames. One Bolt temporal tree bounds the whole
+-- ring: each part has a single leaf covering everywhere it has been within it -- see
+-- central/README.md's "Hitbox History" section for the full design.
+local FRAME_CAP = 64
+
+local RAYCAST_FRAME_RANGE = 1
+local COLLISION_FRAME_RANGE = 1
 
 -- Enum.StepFrequency members are all named "Hz<N>" (Hz1, Hz5, Hz10, Hz15, Hz30, Hz60), so this
 -- stays correct if Roblox adds a member, unlike a hardcoded name -> Hz lookup table.
 local stepHz = assert(tonumber(StepFrequency.Name:sub(3)), "Enum.StepFrequency member name didn't parse as Hz<N>")
 
--- The block currently being refilled holds a mix of new frames and ~FRAME_CAP-frame-stale ones,
--- so it's treated as out of service; the ceiling only covers the other (UNIONS_PER_PART - 1) blocks.
-local LATENCY_CEILING = (UNIONS_PER_PART - 1) * UNION_SIZE / stepHz
+-- The deepest rewind the ring can serve. A query resolves the player's rewound frame plus
+-- frameRange frames either side of it, and the older side must still be inside the ring -- one
+-- frame past its end wraps around onto the newest frame instead.
+local LATENCY_CEILING = (FRAME_CAP - 1 - math.max(RAYCAST_FRAME_RANGE, COLLISION_FRAME_RANGE)) / stepHz
 
 local Settings = {
     DEBUG_MODE = false,
@@ -40,26 +42,23 @@ local Settings = {
     LATENCY_ATTRIBUTE = "PartLatency",
 
     FRAME_CAP = FRAME_CAP,
-    UNION_SIZE = UNION_SIZE,
-    UNIONS_PER_PART = UNIONS_PER_PART,
-    UNION_PADDING = 1, -- replaces AABB_PADDING; baked into each leaf's half_extents (see writeLeaf)
-    UNION_PREDICTION_FRAMES = 16, -- cap on velocity-extrapolation inflation (teleport guard)
-    UNION_UPDATE_FRACTION = 0.5, -- shrink a leaf's envelope once it exceeds this multiple of the volume it needs
+    AABB_PADDING = 1, -- studs of slack around a leaf, so a part can move a little before its leaf is rewritten
+    TEMPORAL_BUCKETS = 4, -- slots the temporal tree cuts the history into; more = tighter leaves, slightly more work per sample
+    TREE_REBUILD_CHECK_FRAMES = 600, -- how often (frames) the tree is checked for, and given, a partial rebuild
     LATENCY_CEILING = LATENCY_CEILING, -- derived; see the comment above. MAX_LATENCY is clamped to this.
 
-    RAYCAST_FRAME_RANGE = 1,
-    COLLISION_FRAME_RANGE = 1,
+    RAYCAST_FRAME_RANGE = RAYCAST_FRAME_RANGE,
+    COLLISION_FRAME_RANGE = COLLISION_FRAME_RANGE,
 
     -- how a closest-hit query picks a winner when several frames in range produce a hit
     -- true  = a hit in a frame nearer the player's estimated index wins outright, regardless of distance
     -- false = the spatially closest hit across all frames in range wins (ties go to the nearer frame)
     PREFER_NEAREST_FRAME = true,
 
-    -- Legacy, test-only: the pre-union-hitboxes wall-clock rebuild schedule. Only
-    -- HistoricalHitboxesRef (the frozen reference implementation tests/DifferentialHarness and
-    -- bench/Benchmark diff against) still reads these. Production HistoricalHitboxes drives
-    -- should_rebuild/partial_rebuild off block seals instead (see UnionRegister:Seal), which are
-    -- already staggered by construction, so these no longer need a runtime equivalent.
+    -- Legacy, test-only: the wall-clock rebuild schedule of the original one-tree-per-frame
+    -- design. Only HistoricalHitboxesRef (the frozen reference implementation
+    -- tests/DifferentialHarness and bench/Benchmark diff against) still reads these. Production
+    -- HistoricalHitboxes has a single tree and checks it every TREE_REBUILD_CHECK_FRAMES.
     TREE_REBUILD_CHECK_INTERVAL = 10,
     TREE_REBUILD_CHECK_JITTER = 0.2,
 

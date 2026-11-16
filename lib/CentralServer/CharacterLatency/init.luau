@@ -57,7 +57,7 @@ function CharacterLatency.Start()
 	if MAX_LATENCY > LATENCY_CEILING then
 		warn(string.format(
 			"Central: Settings.MAX_LATENCY (%.3fs) exceeds LATENCY_CEILING (%.3fs); rewind is capped at %.3fs. "
-				.. "Lower MAX_LATENCY, or raise UNIONS_PER_PART/UNION_SIZE, to silence this.",
+				.. "Lower MAX_LATENCY, or raise FRAME_CAP, to silence this.",
 			MAX_LATENCY, LATENCY_CEILING, EFFECTIVE_MAX_LATENCY
 		))
 	end

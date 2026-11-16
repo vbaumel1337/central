@@ -114,7 +114,7 @@ const function consume_properties(): (boolean, Color3, boolean, number, boolean,
 		local color = pending.color :: Color3
 		pending.color = nil
 		changed.color = false
-
+		
 		if color ~= old_color then
 			restore_color = true
 			IMMEDIATE_WIREFRAME.Color3 = color
@@ -210,9 +210,9 @@ end
 
 const function draw_box(cframe: CFrame, shape: bolt.BoxShape)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	draw_box_internal(cframe, shape)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -238,7 +238,7 @@ const function draw_sphere(center: Vector3, shape: bolt.SphereShape)
 
 	local radius = shape.radius
 	draw_sphere_internal(center, radius)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -248,35 +248,35 @@ const function draw_cylinder_internal(cframe: CFrame, shape: bolt.CylinderShape)
 	local axis = cframe.RightVector
 	local half_height = shape.half_height
 	local radius = shape.radius
-
+	
 	local start_point = center - axis * half_height
 	local end_point = center + axis * half_height
-
+	
 	local u = cframe.UpVector
 	local v = cframe.LookVector
-
+	
 	draw_circle(start_point, u, v, radius)
 	draw_circle(end_point, u, v, radius)
-
+	
 	local cursor = 1
-
+	
 	for i = 1, SPHERE_SEGMENTS do
 		local offset = (u * CIRCLE_COS[i] + v * CIRCLE_SIN[i]) * radius
-
+		
 		_cylinder_lines[cursor] = start_point + offset
 		cursor += 1
 		_cylinder_lines[cursor] = end_point + offset
 		cursor += 1
 	end
-
+	
 	IMMEDIATE_WIREFRAME:AddLines(_cylinder_lines)
 end
 
 const function draw_cylinder(cframe: CFrame, shape: bolt.CylinderShape)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	draw_cylinder_internal(cframe, shape)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -310,9 +310,9 @@ end
 
 const function draw_capsule(cframe: CFrame, shape: bolt.CapsuleShape)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	draw_cylinder_internal(cframe, shape)
-
+	
 	local center = cframe.Position
 	local axis = cframe.RightVector
 	local half_height = shape.half_height
@@ -323,10 +323,10 @@ const function draw_capsule(cframe: CFrame, shape: bolt.CapsuleShape)
 
 	local u = cframe.UpVector
 	local v = cframe.LookVector
-
+	
 	draw_hemisphere(start_point, -axis, u, v, radius)
 	draw_hemisphere(end_point, axis, u, v, radius)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -361,7 +361,7 @@ end
 
 const function draw_wedge(cframe: CFrame, shape: bolt.WedgeShape)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	local center = cframe.Position
 	local right = cframe.RightVector
 	local up = cframe.UpVector
@@ -394,13 +394,13 @@ const function draw_wedge(cframe: CFrame, shape: bolt.WedgeShape)
 		v3, v6, v5, v1,
 		v6, v4,
 	}, false)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
 const function draw_corner_wedge(cframe: CFrame, shape: bolt.CornerWedgeShape)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	local center = cframe.Position
 	local right = cframe.RightVector
 	local up = cframe.UpVector
@@ -421,12 +421,52 @@ const function draw_corner_wedge(cframe: CFrame, shape: bolt.CornerWedgeShape)
 	local v3 = v2 + uu -- +r +l +u
 	local v4 = v2 - rr -- -r +l -u
 	local v5 = v1 - rr -- -r -l -u
-
+	
 	IMMEDIATE_WIREFRAME:AddPath({
 		v1, v2, v3, v4,
 		v5, v1, v3, v5,
 		v4, v2, v4, v1,
 	}, false)
+	
+	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
+end
+
+const _hull_lines = table.create(64)
+const function draw_hull_internal(cframe: CFrame, shape: bolt.HullShape)
+	local vertices = shape.vertices
+	local adjacency = shape.adjacency
+	local scale = shape.scale
+
+	--every other buffer here has a fixed length, but a hull's edge count depends on the shape,
+	--so this one is emptied rather than overwritten in place
+	table.clear(_hull_lines)
+
+	local cursor = 1
+
+	for i, neighbours in adjacency do
+		local from = cframe * (vertices[i] * scale)
+
+		for _, j in neighbours do
+			--adjacency records both directions, so each edge is drawn from its lower index only
+			if j > i then
+				_hull_lines[cursor] = from
+				_hull_lines[cursor + 1] = cframe * (vertices[j] * scale)
+				cursor += 2
+			end
+		end
+	end
+
+	IMMEDIATE_WIREFRAME:AddLines(_hull_lines)
+end
+
+--the hull is drawn exactly where the collision functions see it, which means the caller supplies the transform
+
+--a composite positions its children itself, so drawing one of those wants the composed
+--cframe: composite_cframe * child.cf
+const function draw_hull(cframe: CFrame, shape: bolt.HullShape)
+	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
+
+	draw_hull_internal(cframe, shape)
 
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
@@ -435,7 +475,7 @@ const _cone_points = table.create(SPHERE_SEGMENTS)
 const _cone_lines = table.create(SPHERE_SEGMENTS * 2)
 const function draw_cone(base_center: Vector3, tip: Vector3, u: Vector3, v: Vector3, radius: number)
 	local cursor = 1
-
+	
 	for i = 1, SPHERE_SEGMENTS do
 		local offset = (u * CIRCLE_COS[i] + v * CIRCLE_SIN[i]) * radius
 		local point = base_center + offset
@@ -454,15 +494,15 @@ end
 
 const function draw_ray(from: Vector3, to: Vector3)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	IMMEDIATE_WIREFRAME:AddLine(from, to)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
 const function basis_from_axis(axis: Vector3): (Vector3, Vector3)
 	local helper = if math.abs(axis.Y) < .99 then Y_AXIS else X_AXIS
-
+	
 	local u = vector.normalize(vector.cross(axis :: any, helper :: any))
 	local v = vector.normalize(vector.cross(axis :: any, u :: any))
 
@@ -471,7 +511,7 @@ end
 
 const function draw_arrow(from: Vector3, to: Vector3, head_length: number, head_radius: number)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	local delta = to - from
 	local length = vector.magnitude(delta :: any)
 
@@ -488,7 +528,7 @@ const function draw_arrow(from: Vector3, to: Vector3, head_length: number, head_
 	IMMEDIATE_WIREFRAME:AddLine(from, to)
 
 	draw_cone(base_center, to, u, v, head_radius)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -505,6 +545,8 @@ const function draw_primitive(cframe: CFrame, shape: bolt.Shape)
 		draw_corner_wedge(cframe, shape :: bolt.CornerWedgeShape)
 	elseif shape.type == 2^6 then
 		draw_capsule(cframe, shape :: bolt.CapsuleShape)
+	elseif shape.type == 2^7 then
+		draw_hull(cframe, shape :: bolt.HullShape)
 	elseif shape.type == 2^8 then
 		draw_ellipsoid(cframe, shape :: bolt.EllipsoidShape)
 	else
@@ -514,18 +556,18 @@ end
 
 const function draw_primitive_primitive(cframe_a: CFrame, shape_a: bolt.Shape, cframe_b: CFrame, shape_b: bolt.Shape, hit: boolean)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	if hit then
 		next_color(active_theme.intersection)
 	else
 		next_color(active_theme.no_intersection)
 	end
-
+	
 	draw_primitive(cframe_a, shape_a)
-
+	
 	next_color(active_theme.passive)
 	draw_primitive(cframe_b, shape_b)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -562,36 +604,36 @@ end
 
 const function draw_mpr_intersects(cframe_a: CFrame, shape_a: bolt.Shape, cframe_b: CFrame, shape_b: bolt.Shape, hit: boolean, mtv: Vector3, depth: number?, point_a: Vector3?, point_b: Vector3?)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	if not hit then
 		next_color(active_theme.no_intersection)
 		draw_primitive(cframe_a, shape_a)
-
+		
 		next_color(active_theme.passive)
 		draw_primitive(cframe_b, shape_b)
-
+		
 		next_color(active_theme.arrow)
 		local a_pos = cframe_a.Position
 		draw_arrow(a_pos, a_pos + mtv, DEBUG_ARROW_HEIGHT, DEBUG_ARROW_RADIUS)
-
+		
 		reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 		return
 	end
-
+	
 	next_color(active_theme.intersection)
 	draw_primitive(cframe_a, shape_a)
 
 	next_color(active_theme.passive)
 	draw_primitive(cframe_b, shape_b)
-
+	
 	next_color(active_theme.contact_point)
 	draw_sphere_internal(point_a :: Vector3, DEBUG_SPHERE_RADIUS)
 	next_color(active_theme.contact_point)
 	draw_sphere_internal(point_b :: Vector3, DEBUG_SPHERE_RADIUS)	
-
+	
 	next_color(active_theme.arrow)
 	draw_arrow(point_b :: Vector3, point_b :: Vector3 + (mtv :: Vector3 * depth :: number), DEBUG_ARROW_HEIGHT, DEBUG_ARROW_RADIUS)
-
+	
 	reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 end
 
@@ -608,9 +650,9 @@ const function draw_sat_intersects(cframe_a: CFrame, shape_a: bolt.Shape, cframe
 		reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 		return
 	end
-
+	
 	local center_a = cframe_a.Position
-
+	
 	next_color(active_theme.intersection)
 	draw_primitive(cframe_a, shape_a)
 
@@ -625,16 +667,16 @@ end
 
 const function draw_gjk_shapecast_simple(cframe_a: CFrame, direction: Vector3, shape_a: bolt.Shape, cframe_b: CFrame, shape_b: bolt.Shape, hit: boolean, distance: number?)
 	local restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness = consume_properties()
-
+	
 	local ray_origin = cframe_a.Position
-
+	
 	if not hit then
 		next_color(active_theme.ray_miss)
 		draw_ray(ray_origin, ray_origin + direction)
-
+		
 		next_color(active_theme.passive)
 		draw_primitive(cframe_a, shape_a)
-
+		
 		next_color(active_theme.ray_miss)
 		draw_primitive(cframe_a + direction, shape_a)
 
@@ -644,9 +686,9 @@ const function draw_gjk_shapecast_simple(cframe_a: CFrame, direction: Vector3, s
 		reset_properties(restore_color, old_color, restore_transparency, old_transparency, restore_thickness, old_thickness)
 		return
 	end
-
+	
 	local unit_direction = vector.normalize(direction :: any)
-
+	
 	next_color(active_theme.ray_hit)
 	draw_ray(ray_origin, ray_origin + (unit_direction :: any * distance :: number))
 
@@ -697,7 +739,7 @@ const function draw_gjk_shapecast(cframe_a: CFrame, direction: Vector3, shape_a:
 
 	next_color(active_theme.passive)
 	draw_primitive(cframe_b, shape_b)
-
+	
 	next_color(active_theme.contact_point)
 	draw_sphere_internal(point :: Vector3, DEBUG_SPHERE_RADIUS)
 
@@ -712,9 +754,9 @@ const function init(event: RBXScriptSignal?)
 	if connection then
 		connection:Disconnect()
 	end
-
+	
 	event = event or run_service.PreSimulation
-
+	
 	connection = event:Connect(function()
 		IMMEDIATE_WIREFRAME:Clear()
 	end)
@@ -724,11 +766,11 @@ init()
 
 return {
 	init = init,
-
+	
 	next_color = next_color,
 	next_transparency = next_transparency,
 	next_thickness = next_thickness,
-
+	
 	components = {
 		box = draw_box,
 		sphere = draw_sphere,
@@ -737,15 +779,16 @@ return {
 		ellipsoid = draw_ellipsoid,
 		wedge = draw_wedge,
 		corner_wedge = draw_corner_wedge,
-
+		hull = draw_hull,
+		
 		ray = draw_ray,
 		arrow = draw_arrow
 	},
-
+	
 	mpr_intersects = draw_mpr_intersects,
 	sat_intersects = draw_sat_intersects,
 	primitive_primitive = draw_primitive_primitive,
 	raycast_primitive = draw_raycast_primitive,
 	gjk_shapecast_simple = draw_gjk_shapecast_simple,
 	gjk_shapecast = draw_gjk_shapecast
-}
+}

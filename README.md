@@ -8,9 +8,9 @@ that raycasts/shapecasts issued against a player are resolved against where
 that player actually saw the world, not just the current frame. It measures
 each player's perceived replication delay automatically (see
 [How Character Latency Is Measured](#how-character-latency-is-measured)) and
-rewinds hitbox history to match. History frames are grouped into blocks, each
-backed by one AABB tree whose leaves are the *union* of a part's boxes across
-the block (see [Union Hitboxes](#union-hitboxes)); the exact per-frame box is
+rewinds hitbox history to match. The whole history sits behind one AABB tree,
+in which each part has a single leaf bounding everywhere it has been within
+the history (see [Hitbox History](#hitbox-history)); the exact per-frame box is
 still what every query is ultimately resolved against, using the
 [Bolt](https://github.com/unityjaeger/Bolt) library for the collision-detection
 math.
@@ -197,36 +197,62 @@ it but doesn't independently verify it, so a modified client can influence
 how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
 `MAX_LATENCY` as the security-relevant knob if that matters for your game.
 
-## Union Hitboxes
+## Hitbox History
 
-`FRAME_CAP` history frames aren't each backed by their own AABB tree anymore.
-They're grouped into `UNIONS_PER_PART` blocks of `UNION_SIZE` frames
-(defaults: 5 × 16 = 80), each with one tree whose leaves are the *union* of a
-part's boxes across the whole block, padded and (for a moving part)
-extrapolated a little ahead using its previous block's measured sweep. A
-query still resolves against the exact per-frame box — the union tree only
-decides which parts are worth checking at all.
+The last `FRAME_CAP` simulation frames (default 64) are kept. They are bounded
+by a single tree, built on Bolt's
+[temporal tree addon](https://unityjaeger.github.io/Bolt/guides/temporal_tree/):
+each part owns one leaf whose bounds are the union of everywhere it has been
+inside the history. The addon cuts the history into `TEMPORAL_BUCKETS` slots
+and keeps one union per slot, so old motion retires a slot at a time instead
+of the union being rebuilt every frame.
 
-The old one-tree-per-frame design meant every tracked part paid for a full
-`remove_leaf` + `insert_leaf` on **every** history frame: Bolt's tree has a
-fast path that skips that work when a part's motion stays inside its previous
-padded bounds, but a moving part almost never does across a single frame, so
-the fast path essentially never fired. Grouping frames into blocks means only
-the currently-active block's tree is touched per frame, and the padding
-actually gets a chance to absorb a frame or two of motion before a leaf needs
-rewriting.
+A candidate out of that tree only means "this part was near the query at some
+point in the history". Each candidate is then checked against the exact record
+for the one frame being resolved (CFrame, size, `CanCollide` and a tight
+AABB, kept per frame in a ring): first the tight AABB, then the oriented
+exact test.
+
+Three things follow from the single-leaf design:
+
+- **A resting part is nearly free.** It is only sampled when its pose or size
+  changes; the leaf it already has still bounds it.
+- **Leaves are refitted.** The addon never shrinks a leaf in place, so a part
+  that stopped, or one moving around inside the box a teleport left behind,
+  would keep an oversized leaf. Parts that changed recently have their leaf
+  rebuilt at its current bounds on a staggered tick.
+- **Leaves are fat in time.** A leaf covers the whole history rather than one
+  frame, so in a dense scene where everything moves, more candidates reach
+  the per-frame check than with a tree per frame. See
+  [Performance](#performance).
 
 `MAX_LATENCY` (the security-relevant rewind-distance knob, see
-[above](#how-character-latency-is-measured)) is now also clamped to a derived
-`LATENCY_CEILING`: the block currently being refilled holds a mix of fresh and
-~`FRAME_CAP`-frame-stale data, so it's kept out of query range, capping how far
-back a rewind can reach to `(UNIONS_PER_PART - 1) * UNION_SIZE` frames. At
-defaults that's ~1.067s — above the authored `MAX_LATENCY` default of 1s, so
-out-of-the-box behavior is unchanged. `MAX_LATENCY` can still lower the
-effective cap; it can no longer author a value the ring can't honor, and
+[above](#how-character-latency-is-measured)) is clamped to a derived
+`LATENCY_CEILING`: a query resolves the player's rewound frame plus
+`frameRange` frames either side, and the older side has to still be inside the
+ring. At defaults that's ~1.033s, above the authored `MAX_LATENCY` default of
+1s, so out-of-the-box behavior is unchanged. `MAX_LATENCY` can still lower the
+effective cap; it can't author a value the ring can't honor, and
 `CharacterLatency.Start` warns once at startup if it tries to.
 
 ## Performance
+
+> **These tables predate the temporal tree.** Everything below this note was
+> measured on the previous design (history grouped into blocks, one tree per
+> block, here called "union hitboxes" / "New"), and has not been regenerated.
+> The temporal-tree numbers so far, from the same benchmark (400 hitboxes, all
+> moving every frame, each implementation in its own Play session):
+>
+> | | previous (union blocks) | temporal tree |
+> |---|---|---|
+> | `UpdateFrame` | ~480 µs | ~580 µs |
+> | Raycast, hit | 2.3 µs | 5.1 µs |
+> | Raycast, miss | 1.1 µs | 1.4 µs |
+> | SimpleShapecast, hit | 3.7 µs | 4.8 µs |
+> | SimpleShapecast, miss | 1.2 µs | 1.4 µs |
+>
+> Both remain ahead of the original one-tree-per-frame design on
+> `UpdateFrame` (~840 µs in a mixed session).
 
 Measured server-side in a Studio Play session: a grid of anchored hitbox
 parts (7 studs apart), all moved every frame, at default settings
@@ -384,10 +410,9 @@ how many hitboxes fall *inside* the query volume, not how many exist.
 
 If you need to cut cost, reduce how many parts carry `Settings.HITBOX_TAG` —
 adding query volume is comparatively cheap, per the raycast crossover point
-above. (One caveat: a historical tree occasionally rebuilds, now triggered by
-its block sealing rather than a wall-clock timer — see
-[Union Hitboxes](#union-hitboxes); rare and staggered across trees by
-construction, so it shows up in the tail, not the median.)
+above. (One caveat: the history tree is checked for a partial rebuild every
+`TREE_REBUILD_CHECK_FRAMES` frames; rare, so it shows up in the tail, not the
+median.)
 
 ## Settings
 
@@ -411,13 +436,11 @@ runtime, is the safe way to change a default.
 | `HITBOX_TAG` | `"CompensatedHitbox"` | `CollectionService` tag marking a part as lag-compensated. |
 | `OWNER_ATTRIBUTE` | `"HitboxOwner"` | Attribute holding a hitbox's owning player's `Name`. |
 | `LATENCY_ATTRIBUTE` | `"PartLatency"` | Attribute Central writes each player's averaged latency to. |
-| `UNION_SIZE` | `16` | History frames per union block. |
-| `UNIONS_PER_PART` | `5` | Number of block trees kept per part. |
-| `FRAME_CAP` | *derived* = `UNIONS_PER_PART * UNION_SIZE` (`80`) | Size of the history ring buffer; not directly editable — tune `UNION_SIZE`/`UNIONS_PER_PART` instead. |
-| `LATENCY_CEILING` | *derived* ≈ `1.067s` | What the ring can actually service; see [Union Hitboxes](#union-hitboxes). `MAX_LATENCY` is clamped to this. |
-| `UNION_PADDING` | `1` | Padding (studs) baked into each union leaf's bounds, replacing the old `AABB_PADDING`. Per-part and runtime-tunable, unlike a tree's own padding. |
-| `UNION_PREDICTION_FRAMES` | `16` | Caps how many frames of velocity-extrapolation inflation a block's envelope gets, so one teleport frame can't poison the next block. |
-| `UNION_UPDATE_FRACTION` | `0.5` | A leaf is shrunk back to tight bounds once its volume exceeds this multiple of what the current block actually needs. |
+| `FRAME_CAP` | `64` | Depth of the hitbox history ring, in simulation frames. See [Hitbox History](#hitbox-history). |
+| `LATENCY_CEILING` | *derived* ≈ `1.033s` | What the ring can actually service: `FRAME_CAP` less the widest default frame range. `MAX_LATENCY` is clamped to this. |
+| `AABB_PADDING` | `1` | Slack (studs) around each leaf in the history tree, so a part can move a little before its leaf is rewritten. |
+| `TEMPORAL_BUCKETS` | `4` | Slots the temporal tree cuts the history into. More gives tighter leaves for slightly more work per sample. |
+| `TREE_REBUILD_CHECK_FRAMES` | `600` | How often (frames) the history tree is checked for, and given, a partial rebuild. |
 | `RAYCAST_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Raycast`. |
 | `COLLISION_FRAME_RANGE` | `1` | Default `querySettings.frameRange` for `Shapecast`/`SimpleShapecast`/overlap. |
 | `PREFER_NEAREST_FRAME` | `true` | Tie-break when several frames in range produce a hit: `true` = nearest frame wins regardless of distance; `false` = spatially closest wins, ties to nearer frame. |
@@ -431,7 +454,7 @@ runtime, is the safe way to change a default.
 | `LATENCY_MEASURE_PAUSE` | `0.5` | Seconds between measurement cycles. |
 | `RAYCAST_MARGIN` | `1e-4` | Slack added to the live-hit distance before the historical query runs, so a flush hitbox still registers. |
 | `GJK_TOLERANCE` | `1e-4` | Convergence tolerance for the GJK shapecast/intersection routines. |
-| `TREE_REBUILD_CHECK_INTERVAL`, `TREE_REBUILD_CHECK_JITTER` | `10`, `0.2` | Legacy, test-only — only the frozen `HistoricalHitboxesRef` reference implementation still reads these. Production trees rebuild off block seals instead; see [Union Hitboxes](#union-hitboxes). |
+| `TREE_REBUILD_CHECK_INTERVAL`, `TREE_REBUILD_CHECK_JITTER` | `10`, `0.2` | Legacy, test-only — only the frozen `HistoricalHitboxesRef` reference implementation still reads these. The production tree is checked every `TREE_REBUILD_CHECK_FRAMES` instead. |
 
 ## Third-party code
 

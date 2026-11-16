@@ -89,13 +89,7 @@ end
 local GlobalTimeRegister = TimeRegister.new(FRAME_CAP, 0)
 --local CharacterRegisters = {} :: {[Player]: CharacterRegister.CharacterRegister}
 local PartRegisters = {} :: {[BasePart]:PartRegister.PartRegister}
-local HistoricalIndex = HistoricalHitboxes.new(
-	Settings.UNIONS_PER_PART,
-	Settings.UNION_SIZE,
-	Settings.UNION_PADDING,
-	Settings.UNION_PREDICTION_FRAMES,
-	Settings.UNION_UPDATE_FRACTION
-)
+local HistoricalIndex = HistoricalHitboxes.new(FRAME_CAP, Settings.AABB_PADDING, Settings.TEMPORAL_BUCKETS)
 
 local RegistersPending:{PartRegister.PartRegister} = {}
 

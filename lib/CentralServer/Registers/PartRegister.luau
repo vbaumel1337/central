@@ -12,10 +12,13 @@ export type PartData = {
     cframe: CFrame | false,
     size: Vector3,
     canCollide: boolean,
-    -- world-space AABB, written by UnionRegister:UpdateFrame each frame the part is present.
+    -- world-space AABB, written by HistoricalHitboxes:UpdateFrame each frame the part is present.
     -- Reused as-is by the query rejection cascade, so it's not recomputed there.
     aabbMin: Vector3,
     aabbMax: Vector3,
+    -- the bolt box for `size`, written alongside the AABB. One shape object is shared by every
+    -- frame recorded while the part keeps its size.
+    shape: {[string]: any}?,
 }
 
 export type PartRegister = FrameRegister.FrameRegister<PartData> & typeof(setmetatable(

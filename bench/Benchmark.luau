@@ -1,26 +1,45 @@
 --!strict
 -- Reusable benchmark harness for HistoricalHitboxes-shaped implementations. Two things live
 -- here:
---   Benchmark.Run       -- focused Ref-vs-New UpdateFrame/query comparison at a few hitbox counts
---   Benchmark.RunSheets -- the full hitboxCount x queryCount "% of server CPU" matrix from the
---                          design notes' step 4, for Raycast and SimpleShapecast
+--   Benchmark.Run       -- focused UpdateFrame/query comparison of two implementations at a few hitbox counts
+--   Benchmark.RunSheets -- the full hitboxCount x queryCount "% of server CPU" matrix, split by
+--                          query kind (Raycast / SimpleShapecast) and by whether the cast
+--                          connects
 -- Pure module: dependencies (and, for RunSheets, an Adapter per implementation under test) are
 -- passed in rather than required by a fixed path -- same portability convention as
 -- tests/DifferentialHarness.luau. Kept in the repo (not thrown away after one use) so future
 -- perf work has a ready-made comparison tool; see RunBenchmarkSheets.luau in a consumer project
 -- for a runnable example wiring this up against the vendored package.
+--
+-- TWO THINGS THIS HARNESS LEARNED THE HARD WAY, both of which quietly corrupt results:
+--
+-- 1. Part motion must stay OUTSIDE the timed region. An earlier version timed a step() that
+--    moved every part and *then* called UpdateFrame, so the "0 queries" column measured
+--    moveAll + UpdateFrame. moveAll costs about as much as Ref's entire UpdateFrame at 100
+--    hitboxes, and it is identical work for both implementations, so including it dragged every
+--    ratio toward 1.0 -- it reported a 1.26x UpdateFrame speedup where the true figure was
+--    1.70x. Timing is now per-frame around UpdateFrame + queries only.
+--
+-- 2. Only the FIRST sheet run in a Play session is trustworthy. A second run in the same session
+--    has been observed reporting Ref's own SimpleShapecast cell at 155% against 22% in run one,
+--    with both implementations inflated together. Restart the session between runs.
+--
+-- A cheap self-check for (2): with motion hoisted out, the queryCount=0 column is now purely
+-- UpdateFrame, so it should match a standalone UpdateFrame measurement at the same hitbox count.
+-- If it doesn't, the session is polluted and the whole sheet should be thrown away.
+-- One HistoricalHitboxes-shaped implementation under test: how deep its ring is, and how to build
+-- a fresh instance. Every implementation shares the AddPart/UpdateFrame/Query* surface, so this is
+-- all the harness needs to know to drive one.
+export type Implementation = {
+	name: string,
+	frameCap: number,
+	new: () -> any,
+}
+
 export type Deps = {
-	bolt: any,
 	PartRegister: any,
-	HistoricalHitboxesRef: any,
-	HistoricalHitboxesNew: any,
-	refFrameCap: number,
-	refPadding: number,
-	newUnionsPerPart: number,
-	newUnionSize: number,
-	newPadding: number,
-	newPredictionFrames: number,
-	newUpdateFraction: number,
+	ref: Implementation,
+	new: Implementation,
 	hitboxCounts: {number},
 	warmupFrames: number,
 	measureFrames: number,
@@ -40,7 +59,7 @@ export type CellResult = {
 }
 
 -- An Adapter wraps one HistoricalHitboxes-shaped implementation behind a uniform interface, so
--- RunSheets can drive Ref and New (different .new() signatures) through the same matrix logic.
+-- RunSheets can drive every implementation through the same matrix logic.
 export type Adapter = {
 	name: string,
 	frameCap: number,
@@ -49,16 +68,27 @@ export type Adapter = {
 	updateFrame: (hh: any, index: number) -> (),
 	queryRaycast: (hh: any, index: number, origin: Vector3, direction: Vector3) -> (),
 	querySimpleShapecast: (hh: any, index: number, cframe: CFrame, shape: any, direction: Vector3) -> (),
+	-- returns whether a raycast along this geometry finds anything; used to assert that the
+	-- "hit" case really hits and the "miss" case really misses before anything is timed
+	probeRaycast: (hh: any, index: number, origin: Vector3, direction: Vector3) -> boolean,
 	destroy: (hh: any) -> (),
 }
 
+-- Whether the cast connects turns out to be the axis that separates these two implementations,
+-- so it is a first-class dimension rather than an accident of the geometry:
+--   * a HIT bounds the search, so PREFER_NEAREST_FRAME stops after the first frame and exactly
+--     one tree is walked. This is where union hitboxes pay for fatter leaves.
+--   * a MISS has to resolve every offset in frameRange, which is where sharing a tree across
+--     frames wins: Ref walks (2*frameRange + 1) distinct trees, a shared tree is walked once.
+-- Measuring only one of them (the old sheet aimed every cast at a part) hides half the story.
+export type Case = "rayHit" | "rayMiss" | "shapeHit" | "shapeMiss"
+
+local CASES: {Case} = {"rayHit", "rayMiss", "shapeHit", "shapeMiss"}
+
 export type SheetDeps = {
 	PartRegister: any,
-	hitboxCounts: {number}, -- e.g. {0, 1, 10, 100, 1000}. The design notes suggest going up to
-	-- 10000, but that crashed a live Studio session in practice (likely just the sheer Instance
-	-- count -- 10000 real parts, built and torn down per adapter per hitboxCount row, on top of
-	-- whatever else the place is running); if you want that row, try it in a disposable place.
-	queryCounts: {number}, -- e.g. {0, 1, 10, 100, 1000}
+	hitboxCounts: {number},
+	queryCounts: {number},
 	warmupFrames: number,
 	framesPerBatch: number, -- frames timed per batch
 	numBatches: number, -- odd is best; a cell's value is the MEDIAN batch, not the mean -- an
@@ -73,6 +103,7 @@ export type SheetDeps = {
 export type Sheet = {
 	adapterName: string,
 	queryKind: string,
+	case: Case,
 	hitboxCounts: {number},
 	queryCounts: {number},
 	-- cellsPct[hitboxCount][queryCount] -> percent of stepBudgetUs, or "over" if aborted
@@ -112,6 +143,9 @@ local function buildGrid(count: number, parentFolder: Instance): {BasePart}
 	return parts
 end
 
+-- Y is overwritten rather than offset, so every part in an (x, z) column collapses into the same
+-- 32-stud band and only its phase differs. X and Z never change, which is what lets the miss
+-- geometry below sit in a guaranteed-empty lane.
 local function moveAll(parts: {BasePart}, t: number)
 	for i, p in parts do
 		local base = p.CFrame.Position
@@ -128,17 +162,17 @@ local function median(values: {number}): number
 	return (values[n // 2] + values[n // 2 + 1]) / 2
 end
 
--- runs `work` in `numBatches` separate timed batches of `framesPerBatch` calls each, and returns
--- the median per-call microsecond cost across batches -- see the numBatches doc comment on
--- SheetDeps for why median-of-batches instead of one long average.
-local function measureBatched(work: () -> (), numBatches: number, framesPerBatch: number): number
+-- `work` advances the world untimed and returns the microseconds its timed region took. Runs it
+-- in `numBatches` separate batches of `framesPerBatch` frames and returns the median per-frame
+-- cost across batches -- see the numBatches doc comment on SheetDeps for why median-of-batches.
+local function measureBatched(work: () -> number, numBatches: number, framesPerBatch: number): number
 	local batchUs = table.create(numBatches)
 	for b = 1, numBatches do
-		local t0 = os.clock()
+		local total = 0
 		for _ = 1, framesPerBatch do
-			work()
+			total += work()
 		end
-		batchUs[b] = (os.clock() - t0) / framesPerBatch * 1e6
+		batchUs[b] = total / framesPerBatch
 	end
 	return median(batchUs)
 end
@@ -154,27 +188,31 @@ function Benchmark.Run(deps: Deps): {CellResult}
 		local parts = buildGrid(count, folder)
 
 		-- ---- Ref ----
-		local refHH = deps.HistoricalHitboxesRef.new(deps.refFrameCap, deps.refPadding)
+		local refFrameCap = deps.ref.frameCap
+		local refHH = deps.ref.new()
 		local refRegs = {}
 		for i, p in parts do
-			refRegs[i] = deps.PartRegister.new(p, deps.refFrameCap)
+			refRegs[i] = deps.PartRegister.new(p, refFrameCap)
 			refHH:AddPart(refRegs[i])
 		end
 
 		local refIndex = 0
 		for f = 1, deps.warmupFrames do
 			moveAll(parts, f * 0.05)
-			refIndex = (refIndex % deps.refFrameCap) + 1
+			refIndex = (refIndex % refFrameCap) + 1
 			refHH:UpdateFrame(refIndex)
 		end
 
-		local t0 = os.clock()
+		--motion stays outside the accumulator; see the header note
+		local refTotal = 0
 		for f = 1, deps.measureFrames do
 			moveAll(parts, (deps.warmupFrames + f) * 0.05)
-			refIndex = (refIndex % deps.refFrameCap) + 1
+			refIndex = (refIndex % refFrameCap) + 1
+			local t0 = os.clock()
 			refHH:UpdateFrame(refIndex)
+			refTotal += (os.clock() - t0)
 		end
-		local refUpdateFrameUs = (os.clock() - t0) / deps.measureFrames * 1e6
+		local refUpdateFrameUs = refTotal / deps.measureFrames * 1e6
 
 		local rayOrigin = Vector3.new(SPACING * 0.5, 3000, SPACING * 0.5)
 		local rayDir = (parts[math.max(1, #parts // 2)].Position - rayOrigin)
@@ -188,8 +226,8 @@ function Benchmark.Run(deps: Deps): {CellResult}
 		refHH:Destroy()
 
 		-- ---- New ----
-		local newHH = deps.HistoricalHitboxesNew.new(deps.newUnionsPerPart, deps.newUnionSize, deps.newPadding, deps.newPredictionFrames, deps.newUpdateFraction)
-		local newFrameCap = deps.newUnionsPerPart * deps.newUnionSize
+		local newHH = deps.new.new()
+		local newFrameCap = deps.new.frameCap
 		local newRegs = {}
 		for i, p in parts do
 			newRegs[i] = deps.PartRegister.new(p, newFrameCap)
@@ -203,13 +241,15 @@ function Benchmark.Run(deps: Deps): {CellResult}
 			newHH:UpdateFrame(newIndex)
 		end
 
-		local t2 = os.clock()
+		local newTotal = 0
 		for f = 1, deps.measureFrames do
 			moveAll(parts, (deps.warmupFrames + f) * 0.05)
 			newIndex = (newIndex % newFrameCap) + 1
+			local t0 = os.clock()
 			newHH:UpdateFrame(newIndex)
+			newTotal += (os.clock() - t0)
 		end
-		local newUpdateFrameUs = (os.clock() - t2) / deps.measureFrames * 1e6
+		local newUpdateFrameUs = newTotal / deps.measureFrames * 1e6
 
 		local t3 = os.clock()
 		for _ = 1, deps.raycastSamples do
@@ -235,12 +275,17 @@ function Benchmark.Run(deps: Deps): {CellResult}
 	return results
 end
 
--- Measures one row (every queryCount, both query kinds) for one adapter at one hitboxCount.
+export type RowResult = {[Case]: {[number]: number | string}}
+
+-- Measures one row (every queryCount, every case) for one adapter at one hitboxCount.
 -- Split out of RunSheets so multiple adapters can be interleaved row-by-row -- see RunSheets'
 -- doc comment for why that ordering matters.
-local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, boxShape: any): ({[number]: number | string}, {[number]: number | string})
-	local raycastRow: {[number]: number | string} = {}
-	local shapecastRow: {[number]: number | string} = {}
+local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, boxShape: any): (RowResult, {string})
+	local rows: RowResult = {}
+	local notes: {string} = {}
+	for _, case in CASES do
+		rows[case] = {}
+	end
 
 	local folder = Instance.new("Folder")
 	folder.Name = "SheetParts_" .. adapter.name .. "_" .. hitboxCount
@@ -250,17 +295,18 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	local hh = adapter.new()
 
 	-- Stagger registration across a full ring rotation instead of adding every part on frame 1.
-	-- Parts added together share a rotation phase forever (all rotate into a new block on the
-	-- exact same frame, every UNION_SIZE frames), which is both unrealistic (a real game's
-	-- hitboxes appear at staggered times: players spawning, projectiles firing) and creates a
-	-- synchronized cost spike once per rotation that skews a short measurement window depending
-	-- on pure luck of where it lands relative to that spike.
+	-- Parts added together can share a phase forever (an implementation that does periodic
+	-- per-part work would do all of it on the exact same frame), which is both unrealistic (a
+	-- real game's hitboxes appear at staggered times: players spawning, projectiles firing) and
+	-- creates a synchronized cost spike that skews a short measurement window depending on pure
+	-- luck of where it lands relative to that spike.
 	local partsPerFrame = math.max(1, math.ceil(#parts / adapter.frameCap))
 	local nextToAdd = 1
 
 	local index = 0
 	local t = 0
-	local function step()
+	--advances the world; deliberately NOT timed (see the header note on moveAll)
+	local function advance()
 		if #parts > 0 then
 			moveAll(parts, t)
 		end
@@ -273,54 +319,69 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 			adapter.addPart(hh, deps.PartRegister.new(parts[nextToAdd], adapter.frameCap))
 			nextToAdd += 1
 		end
-		adapter.updateFrame(hh, index)
 	end
 
 	for _ = 1, deps.warmupFrames do
-		step()
+		advance()
+		adapter.updateFrame(hh, index)
 	end
 
-	local rayOrigin = Vector3.new(SPACING * 0.5, 3000, SPACING * 0.5)
-	local rayDir = if #parts > 0
-		then (parts[math.max(1, #parts // 2)].Position - rayOrigin).Unit * RAY_LENGTH
+	local hitOrigin = Vector3.new(SPACING * 0.5, 3000, SPACING * 0.5)
+	local hitDir = if #parts > 0
+		then (parts[math.max(1, #parts // 2)].Position - hitOrigin).Unit * RAY_LENGTH
 		else Vector3.new(RAY_LENGTH, 0, 0)
-	local shapeOrigin = CFrame.new(rayOrigin)
 
+	-- A miss that has to actually traverse the tree, not one the root AABB rejects outright.
+	-- Parts never move in X or Z, so the half-spacing lane between columns is empty forever;
+	-- casting straight up it crosses the whole cluster's height and connects with nothing.
+	local side = math.max(1, math.ceil(math.max(hitboxCount, 1) ^ (1 / 3)))
+	local lane = math.max(1, side // 2) * SPACING + SPACING * 0.5
+	local missOrigin = Vector3.new(lane, 2900, lane)
+	local missDir = Vector3.new(0, 400, 0)
+
+	-- assert the two cases are what they claim before anything is timed; a "miss" that quietly
+	-- starts hitting (or vice versa) would silently turn the sheet into two copies of one case
+	if hitboxCount > 0 then
+		if not adapter.probeRaycast(hh, index, hitOrigin, hitDir) then
+			table.insert(notes, ("%s@%d: HIT geometry did not connect"):format(adapter.name, hitboxCount))
+		end
+		if adapter.probeRaycast(hh, index, missOrigin, missDir) then
+			table.insert(notes, ("%s@%d: MISS geometry connected"):format(adapter.name, hitboxCount))
+		end
+	end
+
+	local hitCF, missCF = CFrame.new(hitOrigin), CFrame.new(missOrigin)
 	local abortBudget = deps.stepBudgetUs * deps.timeoutMultiple
-	local raycastAborted, shapecastAborted = false, false
+	local aborted: {[Case]: boolean} = {}
 
 	for _, queryCount in deps.queryCounts do
-		if raycastAborted then
-			raycastRow[queryCount] = "over"
-		else
-			local perFrameUs = measureBatched(function()
-				step()
-				for _ = 1, queryCount do
-					adapter.queryRaycast(hh, index, rayOrigin, rayDir)
-				end
-			end, deps.numBatches, deps.framesPerBatch)
-			if perFrameUs > abortBudget then
-				raycastAborted = true
-				raycastRow[queryCount] = "over"
-			else
-				raycastRow[queryCount] = perFrameUs / deps.stepBudgetUs * 100
+		for _, case in CASES do
+			if aborted[case] then
+				rows[case][queryCount] = "over"
+				continue
 			end
-		end
 
-		if shapecastAborted then
-			shapecastRow[queryCount] = "over"
-		else
-			local perFrameUs = measureBatched(function()
-				step()
-				for _ = 1, queryCount do
-					adapter.querySimpleShapecast(hh, index, shapeOrigin, boxShape, rayDir)
+			local perFrameUs = measureBatched(function(): number
+				advance()
+				local t0 = os.clock()
+				adapter.updateFrame(hh, index)
+				if case == "rayHit" then
+					for _ = 1, queryCount do adapter.queryRaycast(hh, index, hitOrigin, hitDir) end
+				elseif case == "rayMiss" then
+					for _ = 1, queryCount do adapter.queryRaycast(hh, index, missOrigin, missDir) end
+				elseif case == "shapeHit" then
+					for _ = 1, queryCount do adapter.querySimpleShapecast(hh, index, hitCF, boxShape, hitDir) end
+				else
+					for _ = 1, queryCount do adapter.querySimpleShapecast(hh, index, missCF, boxShape, missDir) end
 				end
+				return (os.clock() - t0) * 1e6
 			end, deps.numBatches, deps.framesPerBatch)
+
 			if perFrameUs > abortBudget then
-				shapecastAborted = true
-				shapecastRow[queryCount] = "over"
+				aborted[case] = true
+				rows[case][queryCount] = "over"
 			else
-				shapecastRow[queryCount] = perFrameUs / deps.stepBudgetUs * 100
+				rows[case][queryCount] = perFrameUs / deps.stepBudgetUs * 100
 			end
 		end
 	end
@@ -328,59 +389,73 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	adapter.destroy(hh)
 	folder:Destroy()
 
-	return raycastRow, shapecastRow
+	return rows, notes
 end
 
-export type SheetPair = {raycast: Sheet, shapecast: Sheet}
+export type SheetSet = {
+	sheets: {Sheet},
+	notes: {string},
+}
 
--- Builds a (Raycast, SimpleShapecast) sheet pair for EVERY adapter given, measured with rows
--- interleaved across adapters rather than run one adapter's whole sheet then the next's.
--- Measuring adapter A's complete sheet before adapter B's means B's every cell is timed after
--- however much GC pressure/heap fragmentation A's (often heavier) full run left behind --
--- a real, measured effect in this harness, not a hypothetical one, and it systematically favors
--- whichever adapter goes first. Interleaving at the row level means both adapters hit each
--- hitboxCount under comparable accumulated session state.
+-- Builds a sheet per (adapter, case) for every adapter given, measured with rows interleaved
+-- across adapters rather than running one adapter's whole sheet then the next's. Measuring
+-- adapter A's complete sheet before adapter B's means B's every cell is timed after however much
+-- GC pressure/heap fragmentation A's (often heavier) full run left behind -- a real, measured
+-- effect in this harness, not a hypothetical one, and it systematically favors whichever adapter
+-- goes first. Interleaving at the row level means both adapters hit each hitboxCount under
+-- comparable accumulated session state.
 --
 -- Row 0 hitboxes isolates pure query overhead against empty trees; column 0 queries isolates
--- UpdateFrame. Query counts within a row are tried in increasing order; once one blows past
--- stepBudgetUs * timeoutMultiple, every costlier column in that row is recorded "over" without
--- being attempted (query cost only grows with count, so there's nothing to learn by trying).
-function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: SheetPair}
+-- UpdateFrame (genuinely, now that motion is hoisted out of the timed region). Query counts
+-- within a row are tried in increasing order; once one blows past stepBudgetUs * timeoutMultiple,
+-- every costlier column in that row is recorded "over" without being attempted (query cost only
+-- grows with count, so there's nothing to learn by trying).
+function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: SheetSet}
 	local boxShape = {type = 2 ^ 0, half_extents = Vector3.new(1, 1, 1)} -- shapeMap.BOX; avoids depending on bolt just for this
 
-	local raycastCells: {[string]: {[number]: {[number]: number | string}}} = {}
-	local shapecastCells: {[string]: {[number]: {[number]: number | string}}} = {}
+	local cells: {[string]: {[Case]: {[number]: {[number]: number | string}}}} = {}
+	local notes: {[string]: {string}} = {}
 	for _, adapter in adapters do
-		raycastCells[adapter.name] = {}
-		shapecastCells[adapter.name] = {}
+		cells[adapter.name] = {}
+		notes[adapter.name] = {}
+		for _, case in CASES do
+			cells[adapter.name][case] = {}
+		end
 	end
 
 	for _, hitboxCount in deps.hitboxCounts do
 		for _, adapter in adapters do
-			local raycastRow, shapecastRow = runRow(adapter, hitboxCount, deps, boxShape)
-			raycastCells[adapter.name][hitboxCount] = raycastRow
-			shapecastCells[adapter.name][hitboxCount] = shapecastRow
+			local row, rowNotes = runRow(adapter, hitboxCount, deps, boxShape)
+			for _, case in CASES do
+				cells[adapter.name][case][hitboxCount] = row[case]
+			end
+			for _, n in rowNotes do
+				table.insert(notes[adapter.name], n)
+			end
 		end
 	end
 
-	local result: {[string]: SheetPair} = {}
+	local kindOf: {[Case]: string} = {
+		rayHit = "Raycast (hit)",
+		rayMiss = "Raycast (miss)",
+		shapeHit = "SimpleShapecast (hit)",
+		shapeMiss = "SimpleShapecast (miss)",
+	}
+
+	local result: {[string]: SheetSet} = {}
 	for _, adapter in adapters do
-		result[adapter.name] = {
-			raycast = {
+		local sheets: {Sheet} = {}
+		for _, case in CASES do
+			table.insert(sheets, {
 				adapterName = adapter.name,
-				queryKind = "Raycast",
+				queryKind = kindOf[case],
+				case = case,
 				hitboxCounts = deps.hitboxCounts,
 				queryCounts = deps.queryCounts,
-				cellsPct = raycastCells[adapter.name],
-			},
-			shapecast = {
-				adapterName = adapter.name,
-				queryKind = "SimpleShapecast",
-				hitboxCounts = deps.hitboxCounts,
-				queryCounts = deps.queryCounts,
-				cellsPct = shapecastCells[adapter.name],
-			},
-		}
+				cellsPct = cells[adapter.name][case],
+			})
+		end
+		result[adapter.name] = {sheets = sheets, notes = notes[adapter.name]}
 	end
 	return result
 end
