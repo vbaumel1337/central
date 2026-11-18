@@ -10,3 +10,6 @@ bench/auto/.work/
 
 # benchmark result dumps written by bench/autobench.py
 bench/results/
+
+# Claude Code settings
+.claude/
