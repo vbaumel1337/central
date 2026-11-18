@@ -3,14 +3,25 @@
 --!optimize 2
 -- Hitbox history behind every lag-compensated query, built on Bolt's temporal tree addon.
 --
--- Broad phase: ONE tree for the whole history. Each part owns a single leaf whose bounds are the
+-- Broad phase: ONE tree for the whole history. Each GROUP owns a single leaf whose bounds are the
 -- union of everywhere it has been inside the window, maintained by the temporal tree (bucketed, so
 -- old history retires without rebuilding the union). A candidate out of that tree only means "this
--- part was near the query at some point in the window".
+-- group was near the query at some point in the window".
+--
+-- A group is either a part that was tagged on its own, or every part of a tagged Model (the
+-- register's `group` key). The first is a group of one and keeps the leaf it always had: the part's
+-- own pose and shape go to the temporal tree. A Model's group has one leaf for all its members: each
+-- frame the members' tight AABBs are unioned into one box, and that box is what the temporal tree
+-- is sampled with, so a whole character costs one leaf and one sample instead of one per part.
 --
 -- Narrow phase: the exact per-frame record (CFrame, size, CanCollide, tight AABB) PartRegister
--- already keeps in its ring, read by frame index. A candidate is rejected against that frame's
--- tight AABB first, then resolved with the oriented exact test.
+-- already keeps in its ring, read by frame index. A Model's group first checks the query against
+-- that frame's group box, then each member goes through the same cascade a lone part does: tight
+-- AABB first, then the oriented exact test.
+--
+-- The querying player's own hitboxes are tested here too, at the newest recorded frame instead of
+-- the rewound one (a player's own hitboxes are not lag compensated). Their leaves already span the
+-- present, so they need no tree of their own and no engine query.
 --
 -- Timestamps handed to the temporal tree are frame numbers, not seconds: the window, the buckets
 -- and the rewind depth are then all in the same unit as the ring index queries are addressed by.
@@ -33,6 +44,14 @@ local DEFAULT_GROUP = Settings.DEFAULT_HITBOX_QUERY_GROUP
 local NEG_INF_VEC = -vector.one * math.huge
 local POS_INF_VEC = vector.one * math.huge
 
+-- A group's box is sampled as centre +- half extents, and Vector3 is 32-bit, so the rebuilt edges can
+-- land a hair inside the true box. AABB_PADDING normally hides that, but it may be 0.
+local BOX_EPSILON = Vector3.one * 1e-3
+
+-- every step of a group's frame walk is allowed, see QueryShape
+local ALL_STEPS = -1
+local MAX_MASKED_STEPS = 32
+
 export type Hitbox = {
 	id: number,
 	cframe: CFrame,
@@ -50,28 +69,62 @@ export type Hitbox = {
 
 type PartData = PartRegister.PartData
 
+-- The members of one tagged Model. A part tagged on its own is not in one: it is its own leaf, and
+-- is told apart from a Model's by its tree id being positive where a group's is negative.
+type Group = {
+	id: number, -- the temporal tree's id for this group's leaf; negative, -id is the groups index
+	key: Instance, -- the tagged Model
+	owner: string, -- shared by every member
+	members: {PartInfo},
+
+	listIndex: number, -- position in groupList
+	boxShape: bolt.BoxShape, -- resized in place every time the group box is sampled
+
+	-- the union of the present members' tight AABBs this frame
+	curMin: Vector3,
+	curMax: Vector3,
+	present: boolean, -- whether any member is in the world this frame
+	-- the same per frame, indexed like the register rings. Written every frame the ring slot is reused.
+	frameMin: {Vector3},
+	frameMax: {Vector3},
+	framePresent: {boolean},
+	dirty: boolean, -- a member moved, resized, appeared, vanished, joined or left since the last sample
+
+	-- last box handed to the temporal tree. nil until the first sample, and again after a long
+	-- absence has dropped the group's history.
+	lastMin: Vector3?,
+	lastMax: Vector3?,
+	lastPresent: number, -- last frame any member was in the world
+	lastSnapshot: number, -- last frame a sample was recorded for
+	lastMoved: number, -- last frame the box changed
+}
+
 type PartInfo = {
-	id: number,
+	id: number, -- Hitbox.id; for a part tagged on its own, also its tree id
 	part: BasePart,
 	register: PartRegister.PartRegister,
 	frames: {[number]: PartData},
 	listIndex: number,
 	owner: string,
 	collisionGroup: string,
+	group: Group?, -- the tagged Model's group, nil for a part tagged on its own
+	memberIndex: number, -- position in group.members
+	keyed: boolean, -- a member of a tagged Model, as opposed to a part tagged on its own
 
 	-- the box the part currently has, shared by every frame record written while its size holds
 	shape: bolt.BoxShape,
 	size: Vector3,
 
-	-- last pose handed to the temporal tree, and its tight AABB. nil until the first sample, and
-	-- again after a long absence has dropped the part's history.
+	-- last pose recorded for the part, and its tight AABB. For a part tagged on its own, nil until
+	-- the first sample, and again after a long absence has dropped its history.
 	lastCFrame: CFrame?,
 	aabbMin: Vector3,
 	aabbMax: Vector3,
 
-	lastPresent: number, -- last frame the part was in the world
-	lastSnapshot: number, -- last frame a sample was recorded for
-	lastMoved: number, -- last frame its pose or size changed
+	present: boolean, -- in the world on the last frame it was stepped (Model members only)
+	lastPresent: number, -- last frame the part was in the world (parts tagged on their own only)
+	lastSnapshot: number, -- last frame a sample was recorded for (parts tagged on their own only)
+	lastMoved: number, -- last frame its pose or size changed (parts tagged on their own only)
 }
 
 local HistoricalHitboxes = {}
@@ -81,6 +134,7 @@ export type HistoricalHitboxes = typeof(setmetatable(
 	{} :: {
 		frameCap: number,
 		frame: number,
+		liveIndex: number,
 		tracker: temporal.TemporalTree,
 		tree: bolt.DynamicTree,
 		window: number,
@@ -88,8 +142,12 @@ export type HistoricalHitboxes = typeof(setmetatable(
 		settleFrames: number,
 		parts: {[BasePart]: PartInfo},
 		partList: {PartInfo},
-		infos: {[number]: PartInfo},
-		nextPartId: number,
+		infos: {[number]: PartInfo}, -- parts tagged on their own, by tree id
+		groups: {[number]: Group}, -- tagged Models, by the negative of their tree id
+		groupsByKey: {[Instance]: Group},
+		groupList: {Group},
+		nextId: number,
+		nextGroupId: number,
 		AddPart: (self: any, register: PartRegister.PartRegister) -> (),
 		RemovePart: (self: any, part: BasePart) -> (),
 		UpdateFrame: (self: any, index: number) -> (),
@@ -229,10 +287,15 @@ function HistoricalHitboxes.new(frameCap: number, padding: number, buckets: numb
 	local self = setmetatable({}, HistoricalHitboxes) :: HistoricalHitboxes
 	self.frameCap = frameCap
 	self.frame = 0
+	self.liveIndex = 1
 	self.parts = {}
 	self.partList = {}
 	self.infos = {}
-	self.nextPartId = 0
+	self.groups = {}
+	self.groupsByKey = {}
+	self.groupList = {}
+	self.nextId = 0
+	self.nextGroupId = 0
 
 	-- The temporal tree keeps `buckets` slots live, the newest of which has only just started
 	-- filling, so the history it is guaranteed to bound is (buckets - 1) slots deep rather than
@@ -257,16 +320,63 @@ function HistoricalHitboxes.new(frameCap: number, padding: number, buckets: numb
 	return self
 end
 
+-- The tight AABB of a part's box at `cf`. Bolt types its vectors `vector`, which the type checker
+-- does not treat as Vector3 although they are the same value.
+local function tightBox(cf: CFrame, shape: bolt.Shape): (Vector3, Vector3)
+	local min, max = shapeAABB(cf, shape)
+	return (min :: unknown) :: Vector3, (max :: unknown) :: Vector3
+end
+
 function HistoricalHitboxes.AddPart(self: HistoricalHitboxes, register: PartRegister.PartRegister)
 	local part = register.part
 	if self.parts[part] then
 		return
 	end
 
-	self.nextPartId += 1
-	local id = self.nextPartId
+	self.nextId += 1
+	local id = self.nextId
 	local size = part.Size
 	local shape = bolt.create_box(size)
+	local key = register.group
+
+	local group: Group? = nil
+	if key then
+		group = self.groupsByKey[key]
+		if not group then
+			-- A Model's group is a box of its own, resized each time it is sampled
+			self.nextGroupId += 1
+			local groupId = -self.nextGroupId
+			local boxShape = bolt.create_box(Vector3.one)
+			local frameCap = self.frameCap
+
+			local newGroup: Group = {
+				id = groupId,
+				key = key,
+				owner = register.owner,
+				members = {},
+				listIndex = #self.groupList + 1,
+				boxShape = boxShape,
+				curMin = Vector3.zero,
+				curMax = Vector3.zero,
+				present = false,
+				frameMin = table.create(frameCap, Vector3.zero),
+				frameMax = table.create(frameCap, Vector3.zero),
+				framePresent = table.create(frameCap, false),
+				dirty = true,
+				lastMin = nil,
+				lastMax = nil,
+				lastPresent = 0,
+				lastSnapshot = 0,
+				lastMoved = 0,
+			}
+
+			table.insert(self.groupList, newGroup)
+			self.groupsByKey[key] = newGroup
+			self.groups[-groupId] = newGroup
+			self.tracker:track(groupId, boxShape)
+			group = newGroup
+		end
+	end
 
 	local info: PartInfo = {
 		id = id,
@@ -276,20 +386,31 @@ function HistoricalHitboxes.AddPart(self: HistoricalHitboxes, register: PartRegi
 		listIndex = #self.partList + 1,
 		owner = register.owner,
 		collisionGroup = part.CollisionGroup,
+		group = group,
+		memberIndex = if group then #group.members + 1 else 0,
+		keyed = group ~= nil,
 		shape = shape,
 		size = size,
 		lastCFrame = nil,
 		aabbMin = Vector3.zero,
 		aabbMax = Vector3.zero,
+		present = false,
 		lastPresent = 0,
 		lastSnapshot = 0,
 		lastMoved = 0,
 	}
 
+	if group then
+		table.insert(group.members, info)
+		group.dirty = true
+	else
+		-- tagged on its own: the part's own pose and shape go to the temporal tree
+		self.infos[id] = info
+		self.tracker:track(id, shape)
+	end
+
 	self.parts[part] = info
-	self.infos[id] = info
 	table.insert(self.partList, info)
-	self.tracker:track(id, shape)
 end
 
 function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
@@ -297,8 +418,6 @@ function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
 	if not info then
 		return
 	end
-
-	self.tracker:untrack(info.id)
 
 	local lastIndex = #self.partList
 	local listIndex = info.listIndex
@@ -308,12 +427,54 @@ function HistoricalHitboxes.RemovePart(self: HistoricalHitboxes, part: BasePart)
 		lastInfo.listIndex = listIndex
 	end
 	self.partList[lastIndex] = nil
-
-	self.infos[info.id] = nil
 	self.parts[part] = nil
+
+	local group = info.group
+	if not group then
+		self.tracker:untrack(info.id)
+		self.infos[info.id] = nil
+		return
+	end
+
+	local members = group.members
+	local lastMember = #members
+	local memberIndex = info.memberIndex
+	if memberIndex ~= lastMember then
+		local moved = members[lastMember]
+		members[memberIndex] = moved
+		moved.memberIndex = memberIndex
+	end
+	members[lastMember] = nil
+
+	if lastMember > 1 then
+		group.dirty = true
+		return
+	end
+
+	-- the last member is gone, and with it the group
+	self.tracker:untrack(group.id)
+	self.groups[-group.id] = nil
+	self.groupsByKey[group.key] = nil
+
+	local lastGroup = #self.groupList
+	local groupIndex = group.listIndex
+	if groupIndex ~= lastGroup then
+		local movedGroup = self.groupList[lastGroup]
+		self.groupList[groupIndex] = movedGroup
+		movedGroup.listIndex = groupIndex
+	end
+	self.groupList[lastGroup] = nil
 end
 
--- Records this frame for every part. `index` is the ring slot the frame lands in.
+-- Samples the temporal tree with a group's box. The temporal tree wants a pose and a shape, so the
+-- box goes in as an unrotated box at its own centre: with no rotation between samples the temporal
+-- tree's rotation padding is exactly zero and the leaf is the plain union of the boxes sampled.
+local function sampleGroupBox(tracker: temporal.TemporalTree, id: number, boxShape: bolt.BoxShape, min: Vector3, max: Vector3, timestamp: number)
+	boxShape.half_extents = (max - min) * 0.5 + BOX_EPSILON
+	tracker:snapshot(id, CFrame.new((min + max) * 0.5), timestamp)
+end
+
+-- Records this frame for every part and group. `index` is the ring slot the frame lands in.
 --
 -- A part only reaches the temporal tree when something about it changed. One that sits still
 -- keeps the leaf it already has: that leaf bounds the pose it is still in, so there is nothing to
@@ -324,9 +485,14 @@ end
 -- teleport left behind, would keep an oversized leaf indefinitely. Hence the refit: on a staggered
 -- tick, a part that changed within the last `settleFrames` has its leaf dropped just before the
 -- sample, and the temporal tree inserts a fresh one at exactly the bounds it currently needs.
+--
+-- That is the whole story for a part tagged on its own. A Model's members are not sampled one by
+-- one: the first loop only records each member's frame and tight AABB and notes that its group
+-- changed, and the second loop does what the first does for a lone part, but for the group's box.
 function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 	local frame = self.frame + 1
 	self.frame = frame
+	self.liveIndex = index
 
 	local tracker = self.tracker
 	local tree = self.tree
@@ -339,10 +505,42 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 		info.register:Step()
 
 		local data = info.frames[index]
-		local cf = data.cframe
+		local cf: CFrame | false = data.cframe
+
+		if info.keyed then
+			local group = info.group :: Group
+
+			if cf == false then
+				if info.present then
+					info.present = false
+					group.dirty = true
+				end
+				continue
+			end
+
+			local size = data.size
+			local resized = size ~= info.size
+			if resized then
+				info.shape = bolt.create_box(size)
+				info.size = size
+			end
+
+			if resized or not info.present or cf ~= info.lastCFrame then
+				info.lastCFrame = cf
+				info.present = true
+				info.aabbMin, info.aabbMax = tightBox(cf, info.shape)
+				group.dirty = true
+			end
+
+			data.shape = info.shape
+			data.aabbMin = info.aabbMin
+			data.aabbMax = info.aabbMax
+			continue
+		end
+
 		local id = info.id
 
-		if not cf then
+		if cf == false then
 			-- Out of the world. Its leaf stays put, still bounding the frames it was present for,
 			-- until those have aged out of the ring; then its history goes.
 			if info.lastCFrame and frame - info.lastPresent > window then
@@ -378,7 +576,6 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 				tracked.radius = bolt.circumradius(shape)
 			end
 
-			info.aabbMin, info.aabbMax = shapeAABB(cf, info.shape)
 			info.lastCFrame = cf
 			info.lastMoved = frame
 		end
@@ -386,6 +583,92 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 		info.lastPresent = frame
 
 		local refit = (frame + id) % refitInterval == 0 and frame - info.lastMoved <= settleFrames
+
+		if changed or refit then
+			local tracked = trackedMap[id]
+
+			if refit and tracked.registered then
+				tree:remove(id)
+				tracked.registered = false
+			end
+
+			tracker:snapshot(id, cf, frame)
+			info.lastSnapshot = frame
+
+			if changed then
+				-- snapshot just computed this pose's tight AABB and kept it as last_min/last_max,
+				-- so it is read back here rather than computed a second time
+				info.aabbMin = tracked.last_min :: Vector3
+				info.aabbMax = tracked.last_max :: Vector3
+			end
+		end
+
+		data.shape = info.shape
+		data.aabbMin = info.aabbMin
+		data.aabbMax = info.aabbMax
+	end
+
+	for _, group in self.groupList do
+		local id = group.id
+		local wasDirty = group.dirty
+
+		if wasDirty then
+			-- the union of the members' tight boxes this frame
+			local min: vector = POS_INF_VEC
+			local max: vector = NEG_INF_VEC
+			local anyPresent = false
+
+			for _, member in group.members do
+				if member.present then
+					anyPresent = true
+					min = vector.min(min, (member.aabbMin :: unknown) :: vector)
+					max = vector.max(max, (member.aabbMax :: unknown) :: vector)
+				end
+			end
+
+			group.present = anyPresent
+			if anyPresent then
+				group.curMin = (min :: unknown) :: Vector3
+				group.curMax = (max :: unknown) :: Vector3
+			end
+			group.dirty = false
+		end
+
+		local present = group.present
+		group.framePresent[index] = present
+		group.frameMin[index] = group.curMin
+		group.frameMax[index] = group.curMax
+
+		if not present then
+			-- Out of the world. Its leaf stays put, still bounding the frames it was present for,
+			-- until those have aged out of the ring; then its history goes.
+			if group.lastMin and frame - group.lastPresent > window then
+				tracker:reset(id)
+				group.lastMin = nil
+				group.lastMax = nil
+			end
+			continue
+		end
+
+		local curMin, curMax = group.curMin, group.curMax
+		local lastMin, lastMax = group.lastMin, group.lastMax
+		local changed = lastMin == nil or lastMax == nil or (wasDirty and (curMin ~= lastMin or curMax ~= lastMax))
+
+		if changed then
+			-- same as for a lone part: if the group rested (or was away) since its last sample,
+			-- record where that stretch ended first
+			if lastMin and lastMax and group.lastPresent > group.lastSnapshot then
+				sampleGroupBox(tracker, id, group.boxShape, lastMin, lastMax, group.lastPresent)
+			end
+
+			group.lastMin = curMin
+			group.lastMax = curMax
+			group.lastMoved = frame
+		end
+
+		group.lastPresent = frame
+
+		local refit = (frame + id) % refitInterval == 0 and frame - group.lastMoved <= settleFrames
 
 		if changed or refit then
 			if refit then
@@ -396,13 +679,9 @@ function HistoricalHitboxes.UpdateFrame(self: HistoricalHitboxes, index: number)
 				end
 			end
 
-			tracker:snapshot(id, cf, frame)
-			info.lastSnapshot = frame
+			sampleGroupBox(tracker, id, group.boxShape, curMin, curMax, frame)
+			group.lastSnapshot = frame
 		end
-
-		data.shape = info.shape
-		data.aabbMin = info.aabbMin
-		data.aabbMax = info.aabbMax
 	end
 
 	if frame % TREE_REBUILD_CHECK_FRAMES == 0 and tree:should_rebuild() then
@@ -430,6 +709,8 @@ local function queryCast(
 	local frameCap = self.frameCap
 	local tree = self.tree
 	local infos = self.infos
+	local groups = self.groups
+	local liveIndex = self.liveIndex
 	local respectCanCollide = params ~= nil and params.RespectCanCollide
 
 	-- 1/0 is +-inf in Luau floats, not an error, so an axis-aligned cast is handled the same way
@@ -440,7 +721,7 @@ local function queryCast(
 	local castExtents = Vector3.zero
 	if shape then
 		-- the shape's bounds need not be centred on its origin, so both come from its AABB
-		local castMin, castMax = shapeAABB(castOrigin, shape)
+		local castMin, castMax = tightBox(castOrigin, shape)
 		castCenter = (castMin + castMax) * 0.5
 		castExtents = (castMax - castMin) * 0.5
 	end
@@ -466,29 +747,9 @@ local function queryCast(
 	local frameIndex = 0
 	local frameOffset = 0
 
-	-- rejection cascade for one candidate. `limit` is the traversal's live best fraction, so the
-	-- pre-filter prunes against the best hit so far, not just the cast's own end.
-	local function narrow(id: number, limit: number): number?
-		if recording then
-			recordedCount += 1
-			recorded[recordedCount] = id
-		end
-
-		local info = infos[id]
-		local data = info.frames[frameIndex]
-		local cf = data.cframe
-		if not cf or info.owner == playerName or (respectCanCollide and not data.canCollide) then
-			return nil
-		end
-
-		if not sweptAABB(castCenter, castExtents, invDir, data.aabbMin, data.aabbMax, limit) then
-			return nil
-		end
-
-		if isFilteredOut(info, params) or (check and not check(info.part)) then
-			return nil
-		end
-
+	-- the exact test of one part against the cast, once it has got past the cheaper rejections.
+	-- `limit` is the traversal's live best fraction.
+	local function resolvePart(info: PartInfo, data: PartData, cf: CFrame): number?
 		local hitPoint: Vector3?, distance: number?, hitNormal: Vector3? = nil, nil, nil
 		local box = data.shape :: bolt.BoxShape
 
@@ -517,6 +778,92 @@ local function queryCast(
 		end
 
 		return distance * invLength
+	end
+
+	-- what the tree hands back is a part tagged on its own (a positive id), or the group of a
+	-- tagged Model (a negative one)
+	local function narrow(id: number, limit: number): number?
+		if recording then
+			recordedCount += 1
+			recorded[recordedCount] = id
+		end
+
+		if id > 0 then
+			local info = infos[id]
+			local data: PartData
+			if info.owner == playerName then
+				-- The player's own hitbox: where it is now, not where it was. It is tested once, on
+				-- the walk that resolves the player's own frame, rather than again for every frame
+				-- replayed.
+				if frameOffset ~= 0 then
+					return nil
+				end
+				data = info.frames[liveIndex]
+			else
+				data = info.frames[frameIndex]
+			end
+
+			local cf: CFrame | false = data.cframe
+			if cf == false or (respectCanCollide and not data.canCollide) then
+				return nil
+			end
+
+			if not sweptAABB(castCenter, castExtents, invDir, data.aabbMin, data.aabbMax, limit) then
+				return nil
+			end
+
+			if isFilteredOut(info, params) or (check and not check(info.part)) then
+				return nil
+			end
+
+			return resolvePart(info, data, cf)
+		end
+
+		-- a Model: its box at this frame first, then each member
+		local group = groups[-id]
+		local index = frameIndex
+		if group.owner == playerName then
+			if frameOffset ~= 0 then
+				return nil
+			end
+			index = liveIndex
+		end
+
+		if not group.framePresent[index] then
+			return nil
+		end
+		if not sweptAABB(castCenter, castExtents, invDir, group.frameMin[index], group.frameMax[index], limit) then
+			return nil
+		end
+
+		-- each member goes through the same rejections a part on its own does. `limit` tightens as
+		-- members hit: anything the cast reaches after a hit can no longer be the closest one.
+		local best: number? = nil
+		for _, member in group.members do
+			local data = member.frames[index]
+			local cf: CFrame | false = data.cframe
+			if cf == false or (respectCanCollide and not data.canCollide) then
+				continue
+			end
+
+			if not sweptAABB(castCenter, castExtents, invDir, data.aabbMin, data.aabbMax, limit) then
+				continue
+			end
+
+			if isFilteredOut(member, params) or (check and not check(member.part)) then
+				continue
+			end
+
+			local fraction = resolvePart(member, data, cf)
+			if fraction and (best == nil or fraction < best) then
+				best = fraction
+				if fraction < limit then
+					limit = fraction
+				end
+			end
+		end
+
+		return best
 	end
 
 	local function queryFrame(offset: number)
@@ -605,6 +952,55 @@ local function collides(hitboxCFrame: CFrame, hitboxShape: bolt.BoxShape, cframe
 	return gjk.intersects(hitboxCFrame, hitboxShape, cframe, shape, GJK_TOLERANCE)
 end
 
+-- The ring offset for step 0, 1, 2, ... of the walk 0, -1, +1, -2, +2, ...
+local function stepOffset(step: number): number
+	return if step % 2 == 1 then -(step + 1) // 2 else step // 2
+end
+
+-- The frame a part overlaps the query shape in that is nearest centerIndex, the earlier of the two
+-- on a tie, and its offset from it. `steps` restricts the walk to the steps a bit is set for, which
+-- is how a group tells its members which frames its own box already ruled out.
+local function overlapFrame(
+	info: PartInfo,
+	owned: boolean,
+	lastStep: number,
+	steps: number,
+	centerIndex: number,
+	frameCap: number,
+	liveIndex: number,
+	respectCanCollide: boolean,
+	castMin: Vector3,
+	castMax: Vector3,
+	cframe: CFrame,
+	shape: bolt.Shape
+): (PartData?, number)
+	local frames = info.frames
+
+	for step = 0, lastStep do
+		if steps ~= ALL_STEPS and not bit32.btest(steps, bit32.lshift(1, step)) then
+			continue
+		end
+
+		local offset = stepOffset(step)
+		local data = if owned then frames[liveIndex] else frames[wrapIndex(centerIndex + offset, frameCap)]
+		local cf: CFrame | false = data.cframe
+
+		if cf == false or (respectCanCollide and not data.canCollide) then
+			continue
+		end
+		if not aabbOverlap(castMin, castMax, data.aabbMin, data.aabbMax) then
+			continue
+		end
+		if not collides(cf, data.shape :: bolt.BoxShape, cframe, shape) then
+			continue
+		end
+
+		return data, offset
+	end
+
+	return nil, 0
+end
+
 function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player, centerIndex: number, frameRange: number, cframe: CFrame, shape: bolt.Shape, params: OverlapParams?, check: ((BasePart) -> boolean)?): {[BasePart]: Hitbox}
 	local playerName = player.Name
 	local results: {[BasePart]: Hitbox} = {}
@@ -614,8 +1010,10 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 
 	local frameCap = self.frameCap
 	local infos = self.infos
+	local groups = self.groups
+	local liveIndex = self.liveIndex
 	local respectCanCollide = params ~= nil and params.RespectCanCollide
-	local castMin, castMax = shapeAABB(cframe, shape)
+	local castMin, castMax = tightBox(cframe, shape)
 
 	-- One walk covers every requested frame. Each candidate then keeps the frame nearest to
 	-- centerIndex it actually overlaps in, the earlier of the two on a tie.
@@ -624,32 +1022,57 @@ function HistoricalHitboxes.QueryShape(self: HistoricalHitboxes, player: Player,
 			break
 		end
 
-		local info = infos[id]
-		if info.owner == playerName or isFilteredOut(info, params) or (check and not check(info.part)) then
+		if id > 0 then
+			local info = infos[id]
+			-- the player's own hitbox is tested at the newest frame only, see the header comment
+			local owned = info.owner == playerName
+
+			if isFilteredOut(info, params) or (check and not check(info.part)) then
+				continue
+			end
+
+			local data, offset = overlapFrame(info, owned, if owned then 0 else frameRange * 2, ALL_STEPS, centerIndex, frameCap, liveIndex, respectCanCollide, castMin, castMax, cframe, shape)
+			if data then
+				partCount += 1
+				results[info.part] = makeHitbox(info, data, offset)
+			end
 			continue
 		end
 
-		local frames = info.frames
+		local group = groups[-id]
+		local owned = group.owner == playerName
+		local lastStep = if owned then 0 else frameRange * 2
 
-		for step = 0, frameRange * 2 do
-			-- 0, -1, +1, -2, +2, ...
-			local offset = if step % 2 == 1 then -(step + 1) // 2 else step // 2
-			local data = frames[wrapIndex(centerIndex + offset, frameCap)]
-			local cf = data.cframe
-
-			if not cf or (respectCanCollide and not data.canCollide) then
+		-- A Model: work out once which of the frames the query can reach have its box overlapping
+		-- the query, so a frame the group as a whole misses costs none of its members anything, and
+		-- a group missed in every frame is dropped before a single member is filtered.
+		local steps = ALL_STEPS
+		if lastStep < MAX_MASKED_STEPS then
+			steps = 0
+			for step = 0, lastStep do
+				local index = if owned then liveIndex else wrapIndex(centerIndex + stepOffset(step), frameCap)
+				if group.framePresent[index] and aabbOverlap(castMin, castMax, group.frameMin[index], group.frameMax[index]) then
+					steps = bit32.bor(steps, bit32.lshift(1, step))
+				end
+			end
+			if steps == 0 then
 				continue
 			end
-			if not aabbOverlap(castMin, castMax, data.aabbMin, data.aabbMax) then
-				continue
+		end
+
+		for _, member in group.members do
+			if partCount >= maxParts then
+				break
 			end
-			if not collides(cf, data.shape :: bolt.BoxShape, cframe, shape) then
+			if isFilteredOut(member, params) or (check and not check(member.part)) then
 				continue
 			end
 
-			partCount += 1
-			results[info.part] = makeHitbox(info, data, offset)
-			break
+			local data, offset = overlapFrame(member, owned, lastStep, steps, centerIndex, frameCap, liveIndex, respectCanCollide, castMin, castMax, cframe, shape)
+			if data then
+				partCount += 1
+				results[member.part] = makeHitbox(member, data, offset)
+			end
 		end
 	end
 
@@ -675,6 +1098,9 @@ function HistoricalHitboxes.Destroy(self: HistoricalHitboxes)
 	table.clear(self.parts)
 	table.clear(self.partList)
 	table.clear(self.infos)
+	table.clear(self.groups)
+	table.clear(self.groupsByKey)
+	table.clear(self.groupList)
 end
 
 return HistoricalHitboxes

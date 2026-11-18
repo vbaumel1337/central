@@ -16,6 +16,11 @@ export type Config = {
 	numBatches: number,
 	stepBudgetUs: number,
 	timeoutMultiple: number,
+	movingFraction: number?,
+	groupSize: number?, -- see Benchmark.SheetDeps.groupSize
+	groupLayout: ("grid" | "cluster")?,
+	-- passed to every query, so the cost of filtering by params is measured too; nil = no params
+	queryParams: RaycastParams?,
 	parentFolder: Instance,
 }
 
@@ -48,13 +53,13 @@ function RunBenchmarkSheets.Run(config: Config): Result
 				hh:UpdateFrame(index)
 			end,
 			queryRaycast = function(hh, index, origin, direction)
-				hh:QueryRaycast(dummyPlayer, index, 1, origin, direction)
+				hh:QueryRaycast(dummyPlayer, index, 1, origin, direction, config.queryParams)
 			end,
 			querySimpleShapecast = function(hh, index, cframe, shape, direction)
-				hh:QuerySimpleShapecast(dummyPlayer, index, 1, cframe, shape, direction)
+				hh:QuerySimpleShapecast(dummyPlayer, index, 1, cframe, shape, direction, config.queryParams)
 			end,
 			probeRaycast = function(hh, index, origin, direction)
-				return (hh:QueryRaycast(dummyPlayer, index, 1, origin, direction)) ~= nil
+				return (hh:QueryRaycast(dummyPlayer, index, 1, origin, direction, config.queryParams)) ~= nil
 			end,
 			destroy = function(hh)
 				hh:Destroy()
@@ -71,6 +76,9 @@ function RunBenchmarkSheets.Run(config: Config): Result
 		numBatches = config.numBatches,
 		stepBudgetUs = config.stepBudgetUs,
 		timeoutMultiple = config.timeoutMultiple,
+		movingFraction = config.movingFraction,
+		groupSize = config.groupSize,
+		groupLayout = config.groupLayout,
 		parentFolder = config.parentFolder,
 	}
 

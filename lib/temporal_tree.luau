@@ -1,3 +1,4 @@
+--!native
 --!strict
 --!optimize 2
 -- Vendored from https://github.com/unityjaeger/Bolt (MIT License, Copyright (c) 2026 unityjaeger)

@@ -21,19 +21,22 @@ export type PartData = {
     shape: {[string]: any}?,
 }
 
-export type PartRegister = FrameRegister.FrameRegister<PartData> & typeof(setmetatable(
-    {} :: {
+export type PartRegister = FrameRegister.FrameRegister<PartData> & {
         _observers: {() -> ()},
         part: BasePart,
         owner: string,
+        -- the tagged Model this part is a member of, if any. HistoricalHitboxes keeps every part
+        -- that shares one in a single tree leaf; nil is a part that was tagged on its own.
+        group: Instance?,
         _currentSize: Vector3,
+        _canCollide: boolean,
         _inWorld: boolean,
-    },
-    PartRegister
-))
+}
 
 local partCache: {PartRegister} = {}
 
+-- CFrame is the only property read from the engine every frame. Size, CanCollide and Parent
+-- change rarely, so they are observed (see PartRegister.new) and read back from the register.
 local function SaveData(self: PartRegister, data: PartData)
     if self._inWorld then
         data.cframe = self.part.CFrame
@@ -41,10 +44,12 @@ local function SaveData(self: PartRegister, data: PartData)
         data.cframe = false
     end
     data.size = self._currentSize
-    data.canCollide = self.part.CanCollide
+    data.canCollide = self._canCollide
 end
 
-function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: PartRegister) -> ())?): PartRegister
+-- `group` is the Model the part is a member of, when it is one of a tagged Model's parts. The owner
+-- is then read from the Model, so every member of a group answers to the same player.
+function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: PartRegister) -> ())?, group: Instance?): PartRegister
     local self: PartRegister
 
     if #partCache > 0 then
@@ -86,16 +91,23 @@ function PartRegister.new(part: BasePart, frameCap: number, callback: ((self: Pa
     end
 
     self.part = part
+    self.group = group
     self._currentSize = part.Size
+    self._canCollide = part.CanCollide
     self._inWorld = part.Parent ~= nil
 
-    local owner = part:GetAttribute(Settings.OWNER_ATTRIBUTE)
+    local owner = (group or part):GetAttribute(Settings.OWNER_ATTRIBUTE)
     self.owner = if typeof(owner) == "string" then owner else "Server"
 
     self._observers = self._observers or {}
     
     table.insert(self._observers, Observers.observeProperty(part, "Size", function(size)
         self._currentSize = (size :: Vector3)
+        return
+    end))
+
+    table.insert(self._observers, Observers.observeProperty(part, "CanCollide", function(canCollide)
+        self._canCollide = (canCollide :: boolean)
         return
     end))
 

@@ -3,7 +3,7 @@
 --!optimize 2
 local RunService = game:GetService("RunService")
 local PhysicsService = game:GetService("PhysicsService")
-local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
 
 local Registers = script.Registers
 local TimeRegister = require(Registers.TimeRegister)
@@ -93,14 +93,111 @@ local HistoricalIndex = HistoricalHitboxes.new(FRAME_CAP, Settings.AABB_PADDING,
 
 local RegistersPending:{PartRegister.PartRegister} = {}
 
-local OwnedHitboxParts = {} :: {[Player]: {BasePart}}
+-- A tagged Model's hitboxes are its Parts and MeshParts, except an accessory's: those are the
+-- handles of things worn, and are not part of the body that is hit.
+local function isModelMember(instance: Instance): boolean
+	return (instance:IsA("Part") or instance:IsA("MeshPart")) and instance:FindFirstAncestorWhichIsA("Accoutrement") == nil
+end
+
+-- Registers a part as a hitbox, as a member of `group` (the tagged Model it belongs to) or, with
+-- none, on its own. A register that is already there is kept: one that is waiting to be destroyed
+-- is only given back its life when it is for the same group the part is being registered for.
+local function registerPart(part: BasePart, group: Instance?): PartRegister.PartRegister
+	local existing = PartRegisters[part]
+	if existing and not existing._isDestroyed then
+		if existing.group == group then
+			existing:UnscheduleDestroy()
+		end
+		return existing
+	end
+
+	if not table.find(HITBOX_GROUPS, part.CollisionGroup) then
+		part.CollisionGroup = DEFAULT_HITBOX_COLLISIONGROUP
+	end
+
+	local register = PartRegister.new(part, FRAME_CAP, function()
+		PartRegisters[part] = nil
+		HistoricalIndex:RemovePart(part)
+	end, group)
+
+	-- known from the moment it is made, not when the next step adds it to the history, so the same
+	-- part met again before then (tagged on its own and inside a tagged Model, say) is one hitbox
+	PartRegisters[part] = register
+	table.insert(RegistersPending, register)
+	return register
+end
+
+local warnedNested = setmetatable({} :: {[Instance]: boolean}, {__mode = "k"})
+
+-- A part tagged on its own.
+local function observePart(part: BasePart): (() -> ())?
+	local existing = PartRegisters[part]
+	if existing and existing.group ~= nil and not existing._isDestroyed and not existing._pendingDestroy then
+		-- a member of a tagged Model already, and that Model's register is the one that counts
+		return nil
+	end
+
+	local register = registerPart(part, nil)
+	return function()
+		register:ScheduleDestroy()
+	end
+end
+
+-- A tagged Model: every Part and MeshPart in it, now and later, is a member of one group.
+local function observeModel(model: Model): (() -> ())?
+	local outer = model:FindFirstAncestorWhichIsA("Model")
+	while outer do
+		if CollectionService:HasTag(outer, Settings.HITBOX_TAG) then
+			if not warnedNested[model] then
+				warnedNested[model] = true
+				warn(`Central: {model:GetFullName()} is tagged inside {outer:GetFullName()}, which is tagged too. The outer Model owns all of its parts; tag only one of them.`)
+			end
+			return nil
+		end
+		outer = outer:FindFirstAncestorWhichIsA("Model")
+	end
+
+	local members: {[Instance]: PartRegister.PartRegister} = {}
+
+	local function addMember(instance: Instance)
+		if not isModelMember(instance) then
+			return
+		end
+
+		local part = instance :: BasePart
+		local existing = PartRegisters[part]
+		if existing and not existing._isDestroyed and existing.group ~= model and not existing._pendingDestroy then
+			-- already a hitbox, tagged on its own or through another Model: the first one wins
+			return
+		end
+		members[part] = registerPart(part, model)
+	end
+
+	local addedConnection = model.DescendantAdded:Connect(addMember)
+	local removingConnection = model.DescendantRemoving:Connect(function(instance)
+		local register = members[instance]
+		if register then
+			members[instance] = nil
+			register:ScheduleDestroy()
+		end
+	end)
+
+	for _, descendant in model:GetDescendants() do
+		addMember(descendant)
+	end
+
+	return function()
+		addedConnection:Disconnect()
+		removingConnection:Disconnect()
+		for _, register in members do
+			register:ScheduleDestroy()
+		end
+		table.clear(members)
+	end
+end
 
 local PlayerLatencies = {} :: {[Player]: number}
 local PlayerIndices = {} :: {[Player]: number}
-
-function CentralServer.GetOwnedHitboxParts(player: Player): {BasePart}
-	return OwnedHitboxParts[player] or {}
-end
 
 local hasStarted = false
 
@@ -126,72 +223,24 @@ function CentralServer.Start()
 		CentralServer.AddCollisionGroup(name)
 	end
 
-	Observers.observeTag(Settings.HITBOX_TAG, function(part:BasePart)
-		if not part:IsA("BasePart") then
-			return
+	Observers.observeTag(Settings.HITBOX_TAG, function(instance: Instance): (() -> ())?
+		if instance:IsA("BasePart") then
+			return observePart(instance)
+		elseif instance:IsA("Model") then
+			return observeModel(instance)
 		end
-		local register = PartRegisters[part]
-		if not register or register._isDestroyed then
-
-			if not table.find(HITBOX_GROUPS, part.CollisionGroup) then
-				part.CollisionGroup = DEFAULT_HITBOX_COLLISIONGROUP
-			end
-
-			register = PartRegister.new(part, FRAME_CAP, function()
-					PartRegisters[part] = nil
-					HistoricalIndex:RemovePart(part)
-			end)
-
-			table.insert(RegistersPending, register:: PartRegister.PartRegister)
-		else
-			register:UnscheduleDestroy()
-		end
-
-		local owner: Player? = nil
-		local ownerName = part:GetAttribute(Settings.OWNER_ATTRIBUTE)
-		if typeof(ownerName) == "string" then
-			local ownerInstance = Players:FindFirstChild(ownerName)
-			if ownerInstance and ownerInstance:IsA("Player") then
-				owner = ownerInstance
-			end
-		end
-
-		if owner then
-			local owned = OwnedHitboxParts[owner]
-			if not owned then
-				owned = {}
-				OwnedHitboxParts[owner] = owned
-			end
-			table.insert(owned, part)
-		end
-
-		return function()
-			register:ScheduleDestroy()
-
-			if owner then
-				local owned = OwnedHitboxParts[owner]
-				if owned then
-					local index = table.find(owned, part)
-					if index then
-						table.remove(owned, index)
-					end
-					if #owned == 0 then
-						OwnedHitboxParts[owner] = nil
-					end
-				end
-			end
-		end
+		return nil
 	end, {workspace})
 
 	if Settings.AUTO_ADD_CHARACTERS then
-		Observers.observeCharacter(function(player, charcter)
-			for _, part in charcter:GetChildren() do
-				if part:IsA("Part") then
-					part:SetAttribute(Settings.OWNER_ATTRIBUTE, player.Name)
-					part:AddTag(Settings.HITBOX_TAG)
-				end
+		-- the character Model is the hitbox group, so a whole character is one leaf in the history.
+		-- The owner goes on first: it is read when the Model's parts are registered.
+		Observers.observeCharacter(function(player, character)
+			character:SetAttribute(Settings.OWNER_ATTRIBUTE, player.Name)
+			character:AddTag(Settings.HITBOX_TAG)
+			return function()
+				character:RemoveTag(Settings.HITBOX_TAG)
 			end
-			return nil
 		end)
 	end
 

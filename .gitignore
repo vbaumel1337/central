@@ -4,3 +4,9 @@ wally.lock
 *.rbxl
 !examples/*.rbxl
 globalTypes.d.luau
+
+# scratch files of bench/autobench.py (generated config and place files)
+bench/auto/.work/
+
+# benchmark result dumps written by bench/autobench.py
+bench/results/

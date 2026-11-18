@@ -15,7 +15,7 @@ export type Implementation = {
 
 export type Deps = {
 	bolt: any,
-	PartRegister: any, -- .new(part, frameCap, callback?)
+	PartRegister: any, -- .new(part, frameCap, callback?, group?)
 	ref: Implementation,
 	new: Implementation,
 	framesToRun: number,
@@ -52,8 +52,12 @@ type TestPart = {
 	part: BasePart,
 	motion: Motion,
 	activationFrame: number?, -- nil = added on frame 1; otherwise AddPart happens on this frame
+	removalFrame: number?, -- nil = never; otherwise RemovePart happens on this frame
 	added: boolean,
+	removed: boolean?,
 	registers: {any}?, -- one PartRegister per implementation, once added
+	group: Instance?, -- the Model it is registered as a member of; implementations that predate groups ignore it
+	parent: Instance?, -- where it lives while it is in the world; nil = the harness's folder
 }
 
 function Harness.Run(deps: Deps): Report
@@ -70,13 +74,13 @@ function Harness.Run(deps: Deps): Report
 		table.insert(mismatches, msg)
 	end
 
-	local function makePart(name: string, size: Vector3): BasePart
+	local function makePart(name: string, size: Vector3, parent: Instance?): BasePart
 		local p = Instance.new("Part")
 		p.Name = name
 		p.Anchored = true
 		p.CanCollide = true
 		p.Size = size
-		p.Parent = deps.parentFolder
+		p.Parent = parent or deps.parentFolder
 		return p
 	end
 
@@ -181,6 +185,140 @@ function Harness.Run(deps: Deps): Report
 		return CFrame.new(ROW2 + Vector3.new(180, 0, 0)), size, true
 	end, added = false})
 
+	-- ---- Models: every part of a rig is registered as a member of one group ----
+	-- A third row, 60 studs up, clear of both rows above (the cluster-wide overlap probe near the
+	-- bottom of this file spans only the first two). Each rig keeps to its own stretch of x, and
+	-- the rigs' parts are the ones the group's box has to bound without losing any of them.
+	local ROW3 = BASE + Vector3.new(0, 60, 0)
+
+	local function addRig(name: string): Model
+		local model = Instance.new("Model")
+		model.Name = name
+		model.Parent = deps.parentFolder
+		return model
+	end
+
+	local function addMember(model: Model, name: string, size: Vector3, motion: Motion, activationFrame: number?, removalFrame: number?)
+		local testPart: TestPart = {
+			part = makePart(name, size, model),
+			motion = motion,
+			activationFrame = activationFrame,
+			removalFrame = removalFrame,
+			added = false,
+			group = model,
+			parent = model,
+		}
+		table.insert(testParts, testPart)
+	end
+
+	-- six parts moving together on a circle and turning, with limbs swinging about the torso: the
+	-- members move relative to each other, and the head resizes
+	local walker = addRig("Walker")
+	local function walkerRoot(f: number): CFrame
+		local around = Vector3.new(math.sin(f * 0.03) * 15, 0, math.cos(f * 0.03) * 15)
+		return CFrame.new(ROW3 + Vector3.new(40, 0, 0) + around) * CFrame.Angles(0, f * 0.05, 0)
+	end
+	local function swing(f: number): number
+		return math.sin(f * 0.2)
+	end
+	addMember(walker, "WalkerTorso", Vector3.new(2, 2, 1), function(f)
+		return walkerRoot(f), Vector3.new(2, 2, 1), true
+	end)
+	addMember(walker, "WalkerHead", Vector3.new(1.2, 1.2, 1.2), function(f)
+		local size = if f % 50 < 25 then Vector3.new(1.2, 1.2, 1.2) else Vector3.new(1.6, 0.8, 1.2)
+		return walkerRoot(f) * CFrame.new(0, 1.8, 0), size, true
+	end)
+	addMember(walker, "WalkerArmL", Vector3.new(0.6, 2, 0.6), function(f)
+		return walkerRoot(f) * CFrame.new(-1.6, 0.8, 0) * CFrame.Angles(swing(f), 0, 0) * CFrame.new(0, -1, 0), Vector3.new(0.6, 2, 0.6), true
+	end)
+	addMember(walker, "WalkerArmR", Vector3.new(0.6, 2, 0.6), function(f)
+		return walkerRoot(f) * CFrame.new(1.6, 0.8, 0) * CFrame.Angles(-swing(f), 0, 0) * CFrame.new(0, -1, 0), Vector3.new(0.6, 2, 0.6), true
+	end)
+	addMember(walker, "WalkerLegL", Vector3.new(0.8, 2, 0.8), function(f)
+		return walkerRoot(f) * CFrame.new(-0.5, -1, 0) * CFrame.Angles(-swing(f) * 0.8, 0, 0) * CFrame.new(0, -1, 0), Vector3.new(0.8, 2, 0.8), true
+	end)
+	addMember(walker, "WalkerLegR", Vector3.new(0.8, 2, 0.8), function(f)
+		return walkerRoot(f) * CFrame.new(0.5, -1, 0) * CFrame.Angles(swing(f) * 0.8, 0, 0) * CFrame.new(0, -1, 0), Vector3.new(0.8, 2, 0.8), true
+	end)
+
+	-- one member comes and goes (10 frames in, 10 out) while the rest of the group stays
+	local flicker = addRig("Flicker")
+	addMember(flicker, "FlickerAnchor", Vector3.new(4, 4, 4), function(f)
+		return CFrame.new(ROW3 + Vector3.new(120, 0, 0)), Vector3.new(4, 4, 4), true
+	end)
+	addMember(flicker, "FlickerBlink", Vector3.new(4, 4, 4), function(f)
+		if (f // 10) % 2 == 0 then
+			return CFrame.new(ROW3 + Vector3.new(128, 0, 0) + Vector3.new(0, 0, f * 0.05)), Vector3.new(4, 4, 4), true
+		end
+		return nil, Vector3.new(4, 4, 4), true
+	end)
+	addMember(flicker, "FlickerDrifter", Vector3.new(3, 3, 3), function(f)
+		return CFrame.new(ROW3 + Vector3.new(120, 0, 8) + Vector3.new(math.sin(f * 0.07) * 3, 0, 0)), Vector3.new(3, 3, 3), true
+	end)
+
+	-- members joining and leaving a group that lives on: one arrives late, one is registered from
+	-- the start and removed mid-run, one comes and goes within the run
+	local growing = addRig("Growing")
+	addMember(growing, "GrowingCore", Vector3.new(4, 4, 4), function(f)
+		return CFrame.new(ROW3 + Vector3.new(200, 0, 0)), Vector3.new(4, 4, 4), true
+	end)
+	addMember(growing, "GrowingMover", Vector3.new(3, 3, 3), function(f)
+		return CFrame.new(ROW3 + Vector3.new(200, 0, 7) + Vector3.new(math.sin(f * 0.05) * 6, 0, 0)), Vector3.new(3, 3, 3), true
+	end)
+	addMember(growing, "GrowingLate", Vector3.new(3, 3, 3), function(f)
+		return CFrame.new(ROW3 + Vector3.new(200, 0, -7) + Vector3.new(math.sin(f * 0.02) * 10, 0, 0)), Vector3.new(3, 3, 3), true
+	end, 90)
+	addMember(growing, "GrowingLeaver", Vector3.new(3, 3, 3), function(f)
+		return CFrame.new(ROW3 + Vector3.new(210, 0, 0) + Vector3.new(0, f * 0.02, 0)), Vector3.new(3, 3, 3), true
+	end, nil, 150)
+	addMember(growing, "GrowingVisitor", Vector3.new(3, 3, 3), function(f)
+		return CFrame.new(ROW3 + Vector3.new(192, 0, 0) + Vector3.new(0, 0, f * 0.05)), Vector3.new(3, 3, 3), true
+	end, 70, 130)
+
+	-- a group whose only member is removed (the group goes with it), then another joins the same
+	-- Model and the group starts over
+	local fleeting = addRig("Fleeting")
+	addMember(fleeting, "FleetingFirst", Vector3.new(4, 4, 4), function(f)
+		return CFrame.new(ROW3 + Vector3.new(250, 0, 0)), Vector3.new(4, 4, 4), true
+	end, nil, 100)
+	addMember(fleeting, "FleetingSecond", Vector3.new(4, 4, 4), function(f)
+		return CFrame.new(ROW3 + Vector3.new(250, 0, 12)), Vector3.new(4, 4, 4), true
+	end, 120)
+
+	-- the whole group is away for much longer than the history is deep and comes back somewhere
+	-- else each time: its history is dropped while it is gone and has to start over cleanly
+	local vanisher = addRig("Vanisher")
+	for i, offset in {Vector3.new(0, 0, 0), Vector3.new(6, 0, 0), Vector3.new(0, 5, 0)} do
+		addMember(vanisher, "Vanisher" .. i, Vector3.new(4, 4, 4), function(f)
+			if f % 200 >= 40 then
+				return nil, Vector3.new(4, 4, 4), true
+			end
+			local cycle = f // 200
+			return CFrame.new(ROW3 + Vector3.new(300, 0, 0) + offset + Vector3.new(0, 0, (cycle % 3) * 12 + (f % 200) * 0.1)), Vector3.new(4, 4, 4), true
+		end)
+	end
+
+	-- the whole group jumps 75 studs and back, so the frames either side of a teleport are both
+	-- in history, and a group's box has to cover members that are far from where they just were
+	local blinkers = addRig("GroupBlinker")
+	for i, offset in {Vector3.new(0, 0, 0), Vector3.new(7, 0, 0), Vector3.new(0, 4, 5)} do
+		addMember(blinkers, "GroupBlinker" .. i, Vector3.new(4, 4, 4), function(f)
+			local hop = f // 37
+			return CFrame.new(ROW3 + Vector3.new(350, 0, 0) + offset + Vector3.new(0, 0, (hop % 4) * 25)), Vector3.new(4, 4, 4), true
+		end)
+	end
+
+	-- runs, then rests for longer than the whole history, then runs again; every member rests
+	-- together, and the group's leaf has to keep bounding it
+	local sprinters = addRig("GroupSprinter")
+	for i, offset in {Vector3.new(0, 0, 0), Vector3.new(5, 0, 0)} do
+		addMember(sprinters, "GroupSprinter" .. i, Vector3.new(4, 4, 4), function(f)
+			local phase = f % 260
+			local travelled = (f // 260) * 30 + math.min(phase, 60) * 0.5
+			return CFrame.new(ROW3 + Vector3.new(400, 0, 0) + offset + Vector3.new(0, 0, travelled % 40)), Vector3.new(4, 4, 4), true
+		end)
+	end
+
 	local dummyPlayer = {Name = "__DifferentialHarnessProbe__"} :: any
 
 	local function compareRay(label: string, refCenter: number, newCenter: number, frameRange: number, origin: Vector3, direction: Vector3)
@@ -275,18 +413,19 @@ function Harness.Run(deps: Deps): Report
 		tp.part.Size = size
 		tp.part.CanCollide = canCollide
 		if cf then
-			tp.part.Parent = deps.parentFolder
+			tp.part.Parent = tp.parent or deps.parentFolder
 			tp.part.CFrame = cf
 		else
 			tp.part.Parent = nil
 		end
 
-		-- PartRegister learns about Size and Parent through property-changed signals. Under
+		-- PartRegister learns about Size, CanCollide and Parent through property-changed signals. Under
 		-- deferred signal behaviour those don't fire until this thread yields, and the harness
 		-- never does, so every size change and absence would silently never happen. Write what
 		-- the observers would have written, so the run doesn't depend on the place's settings.
 		for _, register in tp.registers :: {any} do
 			register._currentSize = size
+			register._canCollide = canCollide
 			register._inWorld = cf ~= nil
 		end
 	end
@@ -296,9 +435,17 @@ function Harness.Run(deps: Deps): Report
 		local newIndex = ((f - 1) % newFrameCap) + 1
 
 		for _, tp in testParts do
-			if not tp.added and (tp.activationFrame == nil or f >= tp.activationFrame) then
-				local regRef = deps.PartRegister.new(tp.part, refFrameCap)
-				local regNew = deps.PartRegister.new(tp.part, newFrameCap)
+			if tp.added and tp.removalFrame and f >= tp.removalFrame then
+				-- gone from both implementations at once
+				refHH:RemovePart(tp.part)
+				newHH:RemovePart(tp.part)
+				tp.part.Parent = nil
+				tp.added = false
+				tp.removed = true
+			end
+			if not tp.added and not tp.removed and (tp.activationFrame == nil or f >= tp.activationFrame) then
+				local regRef = deps.PartRegister.new(tp.part, refFrameCap, nil, tp.group)
+				local regNew = deps.PartRegister.new(tp.part, newFrameCap, nil, tp.group)
 				-- Mirror CentralServer/init.luau's `register.index = GlobalTimeRegister.index`:
 				-- a fresh PartRegister's internal ring position must be seeded to one behind the
 				-- target index, so its first Step() (below, inside UpdateFrame) lands exactly on
@@ -367,6 +514,19 @@ function Harness.Run(deps: Deps): Report
 
 			-- one overlap probe sweeping the whole cluster
 			compareShape(("f=%d overlap(%d)"):format(f, backBy), refPast, newPast, 1, CFrame.new(BASE + Vector3.new(150, 0, 0)), deps.bolt.create_box(Vector3.new(400, 100, 100)))
+
+			-- and one over the Models' row. They are in a row of their own so the probe above stays
+			-- what it was, and a group's box sees every part of every rig
+			compareShape(("f=%d rigs overlap(%d)"):format(f, backBy), refPast, newPast, 1, CFrame.new(BASE + Vector3.new(210, 60, 40)), deps.bolt.create_box(Vector3.new(440, 40, 140)))
+
+			-- a small probe where each part was back then: a group that is only partly in the way
+			-- has to be resolved part by part, and the parts that are not in it left out
+			for _, tp in testParts do
+				local pastCF = history[tp][f - backBy]
+				if tp.added and pastCF then
+					compareShape(("f=%d %s overlap-where-it-was(%d)"):format(f, tp.part.Name, backBy), refPast, newPast, 1, CFrame.new(pastCF.Position), deps.bolt.create_box(Vector3.new(5, 5, 5)))
+				end
+			end
 		end
 	end
 

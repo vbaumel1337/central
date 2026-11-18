@@ -1,0 +1,54 @@
+{
+  "name": "central-autobench",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+
+      "Packages": {
+        "$path": "../../Packages",
+
+        "central": {
+          "$path": "../../lib"
+        }
+      }
+    },
+
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+
+      "CentralAutoBench": {
+        "$className": "Folder",
+        "$attributes": {
+          "AutoRun": true
+        },
+
+        "AutoRun": {
+          "$path": "AutoRun.luau"
+        },
+        "RunConfig": {
+          "$path": ".work/RunConfig.json"
+        },
+        "Implementations": {
+          "$path": "../Implementations.luau"
+        },
+        "Benchmark": {
+          "$path": "../Benchmark.luau"
+        },
+        "RunBenchmarkSheets": {
+          "$path": "../RunBenchmarkSheets.luau"
+        },
+        "DifferentialHarness": {
+          "$path": "../../tests/DifferentialHarness.luau"
+        },
+        "OwnedHitboxTest": {
+          "$path": "../../tests/OwnedHitboxTest.luau"
+        },
+        "GroupHitboxTest": {
+          "$path": "../../tests/GroupHitboxTest.luau"
+        }
+      }
+    }
+  }
+}

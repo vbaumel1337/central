@@ -52,10 +52,11 @@ Central.Start()
 ### Queries
 
 Every query takes the `player` it's being cast on behalf of (used to
-lag-compensate against, and to resolve that player's own hitboxes live) and
-an optional `querySettings`. On the client these are a plain pass-through to
-their Roblox counterpart, no compensation happens. On the server, each call
-runs a normal **live** query against the world right now plus a
+lag-compensate against, and to resolve that player's own hitboxes at their
+newest recorded frame) and an optional `querySettings`. On the client these
+are a plain pass-through to their Roblox counterpart, no compensation
+happens. On the server, each call runs a normal **live** query against the
+rest of the world right now (everything that isn't a hitbox) plus a
 **historical** query against that player's rewound hitbox history, and
 merges them: the cast functions return whichever hit is closer, the overlap
 functions union both result sets.
@@ -120,11 +121,44 @@ part:AddTag(Settings.HITBOX_TAG)
 
 - **Owner** (`Settings.OWNER_ATTRIBUTE`): the player who already sees this
   part in the right place on their own screen (e.g. their own character).
-  Set to that player's `Name`, their own queries check it live instead of
-  rewinding it. Everyone else still gets it lag-compensated.
+  Set to that player's `Name`, their own queries check it at its newest
+  recorded frame instead of rewinding it. Everyone else still gets it
+  lag-compensated.
 - Each recorded frame is just a `CFrame`/size/`CanCollide` snapshot, not a
   simulated body, the history has no physics of its own. The live part
   still behaves normally in `workspace` under Roblox's own physics.
+
+#### Tagging a Model
+
+Tag a `Model` instead and every `Part` and `MeshPart` in it becomes a hitbox,
+registered as one **group**: the history keeps a single entry for the whole
+Model and only looks at its parts once a query is near the Model. That is
+cheaper to record than a tag per part, and cheaper to query when the parts sit
+together, as they do on a character. What a query returns does not change.
+
+```lua
+-- server
+model:SetAttribute(Settings.OWNER_ATTRIBUTE, player.Name) -- optional, set before the tag
+model:AddTag(Settings.HITBOX_TAG)
+```
+
+- **Members** are the Model's descendants that are a `Part` or a `MeshPart`,
+  excluding anything under an `Accessory` (or other `Accoutrement`), and any
+  other kind of `BasePart` (`WedgePart`, `TrussPart`, `UnionOperation`, ...).
+  Members are followed as they come and go: a `Part` or `MeshPart` added to the
+  Model later is registered, and one removed keeps its history for one ring
+  of frames, like an untagged part.
+- **Owner:** the `Settings.OWNER_ATTRIBUTE` that counts is the **Model's**, read
+  once when the Model is tagged. A member's own attribute is ignored.
+- **Filters** (`ExcludeInstances`, `IncludeInstances`, `RespectCanCollide`,
+  `CollisionGroup`, `check`) apply to each member separately.
+- `Settings.AUTO_ADD_CHARACTERS` tags the character Model this way, so a
+  character is one group.
+- A part that is tagged on its own *and* sits inside a tagged Model is
+  registered once, by whichever registration happened first. Tag one or the
+  other.
+- A tagged Model inside a tagged Model is not supported: Central warns once and
+  the outer Model owns all the parts.
 
 ### Debug hitbox visualization (server only)
 
@@ -167,8 +201,12 @@ firing player's own latency, so both sides usually land on the same hit
 - Only apply real effects (damage, destroying a part) `if isServer`. The
   client's call is just local feedback.
 - Widen `querySettings.frameRange` if jitter is causing disagreements.
-- A hitbox owned by the querying player is checked live instead of
-  historically, on both realms.
+- A hitbox owned by the querying player is checked at its newest recorded
+  frame instead of the rewound one, on the server. It is tested as a box of
+  its `Size`, like every other hitbox, and `ExcludeInstances`,
+  `IncludeInstances`, `RespectCanCollide`, `CollisionGroup` and `check` all
+  apply to it. With `PREFER_NEAREST_FRAME` on, an owned hit counts as a hit
+  at frame offset 0. On the client a plain live cast is used.
 - Something that moves every step (e.g. a projectile shapecast each frame)
   should use a registered **query** group, not a hitbox group, so it
   doesn't physically collide with hitboxes and all its hit detection goes
@@ -202,8 +240,8 @@ how far back its own shots are rewound, bounded by `MAX_LATENCY`. Treat
 The last `FRAME_CAP` simulation frames (default 64) are kept. They are bounded
 by a single tree, built on Bolt's
 [temporal tree addon](https://unityjaeger.github.io/Bolt/guides/temporal_tree/):
-each part owns one leaf whose bounds are the union of everywhere it has been
-inside the history. The addon cuts the history into `TEMPORAL_BUCKETS` slots
+each part owns one leaf (a tagged Model owns one leaf for all of its parts)
+whose bounds are the union of everywhere it has been inside the history. The addon cuts the history into `TEMPORAL_BUCKETS` slots
 and keeps one union per slot, so old motion retires a slot at a time instead
 of the union being rebuilt every frame.
 
@@ -211,7 +249,10 @@ A candidate out of that tree only means "this part was near the query at some
 point in the history". Each candidate is then checked against the exact record
 for the one frame being resolved (CFrame, size, `CanCollide` and a tight
 AABB, kept per frame in a ring): first the tight AABB, then the oriented
-exact test.
+exact test. A Model's leaf is bounded by the union of its parts' tight AABBs
+each frame, which is also kept per frame in a ring; a candidate Model is first
+checked against that box for the frame being resolved, and only then are its
+parts tested one by one.
 
 Three things follow from the single-leaf design:
 
@@ -253,6 +294,38 @@ effective cap; it can't author a value the ring can't honor, and
 >
 > Both remain ahead of the original one-tree-per-frame design on
 > `UpdateFrame` (~840 µs in a mixed session).
+
+### Tagged Models (groups)
+
+`bench/autobench.py --group-size N` registers every N consecutive grid parts as
+one group; `--group-layout cluster` also moves a group's parts together, inside
+a few studs of each other, the way a character's parts move. Figures are
+microseconds (`UpdateFrame` per frame, the rest per query), the best of 3
+launches, all hitboxes moving every frame, in Studio's edit mode, so only
+compare them with each other. "Ungrouped" is the same implementation with every
+part tagged on its own, run in the same session.
+
+| 400 hitboxes | `UpdateFrame` | Raycast, hit | Raycast, miss | Shapecast, hit | Shapecast, miss |
+|---|---|---|---|---|---|
+| ungrouped | 370 | 4.7 | 1.2 | 4.4 | 1.1-1.4 |
+| groups of 6, parts moving independently | 243 | 7.4 | 1.8 | 8.1 | 1.9 |
+| groups of 16, parts moving independently | 226 | 6.0 | 1.2 | 5.8 | 1.3 |
+| ungrouped, parts clustered in 6s | 371 | 9.3 | 1.2 | 9.5 | 2.4 |
+| groups of 6, parts clustered | 249 | 3.1 | 1.2 | 5.1 | 2.1 |
+| ungrouped, parts clustered in 16s | 377 | 16.1 | 1.2 | 11.5 | 1.3 |
+| groups of 16, parts clustered | 228 | 3.5 | 1.2 | 5.6 | 1.3 |
+
+- A group costs about **35-40% less to record** (`UpdateFrame`), whatever the
+  layout: each part only works out its own tight AABB, and the temporal tree is
+  sampled once per group instead of once per part.
+- Parts that sit together (a character) also **query faster**, 3-4x on a
+  raycast hit, because the tree hands back one candidate per Model where it
+  handed back many overlapping per-part ones. A group of one costs nothing extra: a part tagged on its own takes
+  the same path as before.
+- Parts that are far apart, or move independently over a wide area, make the
+  group's box loose, and then queries get slower (the "moving independently"
+  rows): every candidate Model has its members tested one by one. A Model is
+  worth tagging when its parts stay close together.
 
 Measured server-side in a Studio Play session: a grid of anchored hitbox
 parts (7 studs apart), all moved every frame, at default settings
@@ -428,7 +501,7 @@ runtime, is the safe way to change a default.
 | `DEBUG_LIFETIME` | `1.5` | Seconds a debug draw stays visible before clearing. |
 | `StepFrequency` | `Hz60` | How often Central's `BindToSimulation` loop records a hitbox frame and recomputes rewound indices. |
 | `HitboxStepPriority` | `1000` | Priority Central's internal binding runs at; your own query-calling bindings need a higher number. |
-| `AUTO_ADD_CHARACTERS` | `true` | Auto-tags every part of a spawning player's character as an owned hitbox. |
+| `AUTO_ADD_CHARACTERS` | `true` | Auto-tags a spawning player's character Model, owned by that player, so every `Part` and `MeshPart` of it is a hitbox and the character is one group. |
 | `DEFAULT_HITBOX_QUERY_GROUP` | `"HitboxQuery"` | Fallback query group for an unregistered `CollisionGroup`. |
 | `INITIAL_QUERY_GROUPS` | `{DEFAULT_HITBOX_QUERY_GROUP}` | Query groups auto-registered by `Central.Start()`. |
 | `DEFAULT_HITBOX_COLLISIONGROUP` | `"HitboxCollison"` | Fallback hitbox group for an unregistered `CollisionGroup`. |

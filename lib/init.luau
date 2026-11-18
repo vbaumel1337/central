@@ -204,54 +204,6 @@ function Central.RemoveAllPlayerHitboxes(player: Player)
     hitboxViewsAll[player] = nil
 end
 
-local function isExcluded(part: BasePart, exclude: {Instance}?): boolean
-    if not exclude then
-        return false
-    end
-    for _, excluded in exclude do
-        if part == excluded or part:IsDescendantOf(excluded) then
-            return true
-        end
-    end
-    return false
-end
-
--- Roblox does not reliably prioritize ExcludeInstances over IncludeInstances when the
--- included part is a descendant of the excluded instance, so exclusions must be applied
--- here before the owned parts are ever placed in IncludeInstances.
-local function filterByInclude(owned: {BasePart}, include: {Instance}?, exclude: {Instance}?): {Instance}
-    local filtered: {Instance} = {}
-    for _, part in owned do
-        if isExcluded(part, exclude) then
-            continue
-        end
-        if not include or #include == 0 then
-            table.insert(filtered, part)
-            continue
-        end
-        for _, included in include do
-            if part == included or part:IsDescendantOf(included) then
-                table.insert(filtered, part)
-                break
-            end
-        end
-    end
-    return filtered
-end
-
-local function mergeArrayUnique(result: {BasePart}, extra: {BasePart})
-    local seen: {[BasePart]: boolean} = {}
-    for _, part in result do
-        seen[part] = true
-    end
-    for _, part in extra do
-        if not seen[part] then
-            seen[part] = true
-            table.insert(result, part)
-        end
-    end
-end
-
 local function mergeSetUnique(result: {BasePart}, extra: {[BasePart]: any})
     local seen: {[BasePart]: boolean} = {}
     for _, part in result do
@@ -311,7 +263,10 @@ local function shapecastExcludeRetry(part: Part, direction: Vector3, params: Ray
     end
 end
 
-local function liveHitboxAwareRaycast(player: Player, origin: Vector3, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (RaycastResult?, number?)
+-- The live pass covers the world only. Hitbox parts sit in collision groups the query groups never
+-- collide with, so these casts pass through them; every hitbox, the querying player's own included,
+-- is answered by the historical pass (CentralServer.QueryPlayer*).
+local function liveWorldRaycast(origin: Vector3, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): (RaycastResult?, number?)
     local blanket = RaycastParams.new()
     if params then
         if params.ExcludeInstances then
@@ -338,44 +293,10 @@ local function liveHitboxAwareRaycast(player: Player, origin: Vector3, direction
         result = workspace:Raycast(origin, direction, blanket)
     end
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
-    if #owned > 0 then
-        local ownedParams = RaycastParams.new()
-        if params then
-            if params.ExcludeInstances then
-                ownedParams.ExcludeInstances = params.ExcludeInstances
-            end
-            if params.CollisionGroup then
-                ownedParams.CollisionGroup = params.CollisionGroup
-            end
-            if params.RespectCanCollide ~= nil then
-                ownedParams.RespectCanCollide = params.RespectCanCollide
-            end
-        end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
-
-        if #ownedParams.IncludeInstances == 0 then
-            return result, resultDistance
-        end
-
-        if check then
-            local ownedResult, ownedDistance = raycastExcludeRetry(origin, direction, ownedParams, check)
-            if ownedResult and (not result or (ownedDistance :: number) < (resultDistance :: number)) then
-                result = ownedResult
-                resultDistance = ownedDistance
-            end
-        else
-            local ownedResult = workspace:Raycast(origin, direction, ownedParams)
-            if ownedResult and (not result or ownedResult.Distance < result.Distance) then
-                result = ownedResult
-            end
-        end
-    end
-
     return result, resultDistance
 end
 
-local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) -> {BasePart}, params: OverlapParams?, check: ((BasePart) -> boolean)?): {BasePart}
+local function liveWorldOverlap(queryFn: (OverlapParams?) -> {BasePart}, params: OverlapParams?, check: ((BasePart) -> boolean)?): {BasePart}
     local blanket = OverlapParams.new()
     if params then
         if params.ExcludeInstances then
@@ -398,30 +319,6 @@ local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) 
     end
     local result = queryFn(blanket)
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
-    if #owned > 0 then
-        local ownedParams = OverlapParams.new()
-        if params then
-            if params.ExcludeInstances then
-                ownedParams.ExcludeInstances = params.ExcludeInstances
-            end
-            if params.CollisionGroup then
-                ownedParams.CollisionGroup = params.CollisionGroup
-            end
-            if params.RespectCanCollide ~= nil then
-                ownedParams.RespectCanCollide = params.RespectCanCollide
-            end
-            if params.MaxParts then
-                ownedParams.MaxParts = params.MaxParts
-            end
-        end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
-        if #ownedParams.IncludeInstances > 0 then
-            local ownedResult = queryFn(ownedParams)
-            mergeArrayUnique(result, ownedResult)
-        end
-    end
-
     if check then
         for i = #result, 1, -1 do
             if not check(result[i]) then
@@ -433,7 +330,7 @@ local function liveHitboxAwareOverlap(player: Player, queryFn: (OverlapParams?) 
     return result
 end
 
-local function liveHitboxAwareShapecast(player: Player, part: Part, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): RaycastResult?
+local function liveWorldShapecast(part: Part, direction: Vector3, params: RaycastParams?, check: ((BasePart) -> boolean)?): RaycastResult?
     local blanket = RaycastParams.new()
     if params then
         if params.ExcludeInstances then
@@ -459,36 +356,6 @@ local function liveHitboxAwareShapecast(player: Player, part: Part, direction: V
         result = workspace:Shapecast(part, direction, blanket)
     end
 
-    local owned = CentralServer.GetOwnedHitboxParts(player)
-    if #owned > 0 then
-        local ownedParams = RaycastParams.new()
-        if params then
-            if params.ExcludeInstances then
-                ownedParams.ExcludeInstances = params.ExcludeInstances
-            end
-            if params.CollisionGroup then
-                ownedParams.CollisionGroup = params.CollisionGroup
-            end
-            if params.RespectCanCollide ~= nil then
-                ownedParams.RespectCanCollide = params.RespectCanCollide
-            end
-        end
-        ownedParams.IncludeInstances = filterByInclude(owned, if params then params.IncludeInstances else nil, if params then params.ExcludeInstances else nil)
-
-        if #ownedParams.IncludeInstances > 0 then
-            local ownedResult: RaycastResult?
-            if check then
-                ownedResult = shapecastExcludeRetry(part, direction, ownedParams, check)
-            else
-                ownedResult = workspace:Shapecast(part, direction, ownedParams)
-            end
-
-            if ownedResult and (not result or ownedResult.Distance < result.Distance) then
-                result = ownedResult
-            end
-        end
-    end
-
     return result
 end
 
@@ -497,7 +364,7 @@ function Central.Raycast(player:Player, origin:Vector3, direction:Vector3, rayca
     local check = querySettings and querySettings.check
 
     if isServer then
-        local raycastResult, raycastDistanceOverride = liveHitboxAwareRaycast(player, origin, direction, raycastParams, check)
+        local raycastResult, raycastDistanceOverride = liveWorldRaycast(origin, direction, raycastParams, check)
         if raycastResult then
             distance = raycastDistanceOverride or raycastResult.Distance
             instance = raycastResult.Instance
@@ -546,7 +413,7 @@ function Central.Shapecast(player:Player, part:Part, direction:Vector3, raycastP
     local check = querySettings and querySettings.check
 
     local castResult = if isServer
-        then liveHitboxAwareShapecast(player, part, direction, raycastParams, check)
+        then liveWorldShapecast(part, direction, raycastParams, check)
         else workspace:Shapecast(part, direction, raycastParams)
     if castResult then
         distance = castResult.Distance
@@ -588,7 +455,7 @@ function Central.SimpleShapecast(player:Player, part:Part, direction:Vector3, ra
     local check = querySettings and querySettings.check
 
     local castResult = if isServer
-        then liveHitboxAwareShapecast(player, part, direction, raycastParams, check)
+        then liveWorldShapecast(part, direction, raycastParams, check)
         else workspace:Shapecast(part, direction, raycastParams)
     if castResult then
         distance = castResult.Distance
@@ -623,7 +490,7 @@ end
 
 function Central.GetBoundsInRadius(player:Player, position:Vector3, radius:number, overlapParams:OverlapParams?, querySettings: QueryConfiguration?) : {BasePart}
     local result = if isServer
-        then liveHitboxAwareOverlap(player, function(p) return workspace:GetPartBoundsInRadius(position, radius, p) end, overlapParams, querySettings and querySettings.check)
+        then liveWorldOverlap(function(p) return workspace:GetPartBoundsInRadius(position, radius, p) end, overlapParams, querySettings and querySettings.check)
         else workspace:GetPartBoundsInRadius(position, radius, overlapParams)
 
 
@@ -649,7 +516,7 @@ end
 
 function Central.GetPartBoundsInBox(player:Player, cframe:CFrame, size:Vector3, overlapParams:OverlapParams?, querySettings: QueryConfiguration?) : {BasePart}
     local result = if isServer
-        then liveHitboxAwareOverlap(player, function(p) return workspace:GetPartBoundsInBox(cframe, size, p) end, overlapParams, querySettings and querySettings.check)
+        then liveWorldOverlap(function(p) return workspace:GetPartBoundsInBox(cframe, size, p) end, overlapParams, querySettings and querySettings.check)
         else workspace:GetPartBoundsInBox(cframe, size, overlapParams);
 
 
@@ -675,7 +542,7 @@ end
 
 function Central.GetPartsInPart(player:Player, part:Part, overlapParams:OverlapParams?, querySettings: QueryConfiguration?) : {BasePart}
     local result = if isServer
-        then liveHitboxAwareOverlap(player, function(p) return workspace:GetPartsInPart(part, p) end, overlapParams, querySettings and querySettings.check)
+        then liveWorldOverlap(function(p) return workspace:GetPartsInPart(part, p) end, overlapParams, querySettings and querySettings.check)
         else workspace:GetPartsInPart(part, overlapParams)
 
     if isServer then

@@ -97,6 +97,15 @@ export type SheetDeps = {
 	-- plus a median throws the unlucky one out instead of averaging it in.
 	stepBudgetUs: number, -- 16667 at Hz60; cell value is measured-cost / this, as a percentage
 	timeoutMultiple: number, -- abort a cell (and every costlier cell in its row) past this many step budgets
+	movingFraction: number?, -- share of parts that move each frame, 0..1; nil = all of them
+	-- how many consecutive grid parts share one group key (a Model) when registered; nil or 0 =
+	-- every part on its own. Implementations that predate groups ignore the key, so they measure
+	-- the same either way, which is what makes them a control.
+	groupSize: number?,
+	-- "grid" (default): the group is every N consecutive grid parts, wherever the grid puts them,
+	-- each moving on its own. "cluster": the group's parts sit together around the first one's
+	-- grid position and move as one, the way the parts of a character do.
+	groupLayout: ("grid" | "cluster")?,
 	parentFolder: Instance,
 }
 
@@ -146,10 +155,23 @@ end
 -- Y is overwritten rather than offset, so every part in an (x, z) column collapses into the same
 -- 32-stud band and only its phase differs. X and Z never change, which is what lets the miss
 -- geometry below sit in a guaranteed-empty lane.
-local function moveAll(parts: {BasePart}, t: number)
+--
+-- `movingFraction` (default 1: every part moves every frame, the worst case for a history that
+-- is built for resting parts) picks an evenly spread share of the parts to move; the rest sit
+-- where buildGrid put them.
+--
+-- `phases` and `heights`, when given, replace the part's index as its phase and add to its height:
+-- parts of one cluster share a phase, so they move together.
+local function moveAll(parts: {BasePart}, t: number, movingFraction: number?, phases: {number}?, heights: {number}?)
+	local fraction = movingFraction or 1
 	for i, p in parts do
+		if fraction < 1 and math.floor(i * fraction) == math.floor((i - 1) * fraction) then
+			continue
+		end
 		local base = p.CFrame.Position
-		p.CFrame = CFrame.new(base.X, 3000 + math.sin(t + i) * 16, base.Z)
+		local phase = if phases then phases[i] else i
+		local height = if heights then heights[i] else 0
+		p.CFrame = CFrame.new(base.X, 3000 + math.sin(t + phase) * 16 + height, base.Z)
 	end
 end
 
@@ -294,6 +316,49 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	local parts = buildGrid(hitboxCount, folder)
 	local hh = adapter.new()
 
+	-- one Model per `groupSize` consecutive parts. The parts stay where buildGrid put them: the
+	-- Model is only the key the history groups by, and where the group's owner is read from.
+	local groupSize = deps.groupSize or 0
+
+	-- A cluster: the group's parts are moved to sit within a stud of the group's first part, in a
+	-- 3 x 3 spread with a few studs of height, and share its phase from then on. They keep the grid
+	-- position's lane to themselves, so the empty lane the miss case aims at stays empty.
+	local phases: {number}? = nil
+	local heights: {number}? = nil
+	if groupSize > 0 and deps.groupLayout == "cluster" then
+		phases, heights = {}, {}
+		local phaseList: {number} = phases
+		local heightList: {number} = heights
+		local anchors: {Vector3} = {}
+		for i, part in parts do
+			anchors[i] = part.Position
+		end
+		for i, part in parts do
+			local first = (i - 1) // groupSize * groupSize + 1
+			local slot = i - first
+			local anchor = anchors[first]
+			phaseList[i] = first
+			heightList[i] = (slot // 9) * 2.5
+			part.CFrame = CFrame.new(anchor.X + (slot % 3 - 1), anchor.Y, anchor.Z + ((slot // 3) % 3 - 1))
+		end
+	end
+
+	local groupModels: {[number]: Model} = {}
+	local function groupFor(partIndex: number): Instance?
+		if groupSize <= 0 then
+			return nil
+		end
+		local number = (partIndex - 1) // groupSize + 1
+		local model = groupModels[number]
+		if not model then
+			model = Instance.new("Model")
+			model.Name = "Group" .. number
+			model.Parent = folder
+			groupModels[number] = model
+		end
+		return model
+	end
+
 	-- Stagger registration across a full ring rotation instead of adding every part on frame 1.
 	-- Parts added together can share a phase forever (an implementation that does periodic
 	-- per-part work would do all of it on the exact same frame), which is both unrealistic (a
@@ -308,7 +373,7 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	--advances the world; deliberately NOT timed (see the header note on moveAll)
 	local function advance()
 		if #parts > 0 then
-			moveAll(parts, t)
+			moveAll(parts, t, deps.movingFraction, phases, heights)
 		end
 		t += 0.05
 		index = (index % adapter.frameCap) + 1
@@ -316,7 +381,7 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 			if nextToAdd > #parts then
 				break
 			end
-			adapter.addPart(hh, deps.PartRegister.new(parts[nextToAdd], adapter.frameCap))
+			adapter.addPart(hh, deps.PartRegister.new(parts[nextToAdd], adapter.frameCap, nil, groupFor(nextToAdd)))
 			nextToAdd += 1
 		end
 	end
