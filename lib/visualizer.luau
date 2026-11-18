@@ -755,9 +755,9 @@ const function init(event: RBXScriptSignal?)
 		connection:Disconnect()
 	end
 	
-	event = event or run_service.PreSimulation
-	
-	connection = event:Connect(function()
+	local signal: RBXScriptSignal = event or run_service.PreSimulation
+
+	connection = signal:Connect(function()
 		IMMEDIATE_WIREFRAME:Clear()
 	end)
 end

@@ -36,15 +36,18 @@ end
 -- vector.max/min against the infinity constants is what keeps a 0 * inf NaN on an axis the cast
 -- runs parallel to from poisoning the comparison.
 
+-- Vector3 and `vector` are the same value at runtime but unrelated types to the checker. The
+-- vector.* calls below are cast through unknown (unlike `:: any`, that still checks everything
+-- around the cast) so they stay fastcall-able.
 local function rayAABB(rayOrigin: Vector3, rayInvDir: Vector3, min: Vector3, max: Vector3, maxFraction: number): boolean
-	local t1 = vector.max(NEG_INF_VEC, (min - rayOrigin) * rayInvDir)
-	local t2 = vector.min(POS_INF_VEC, (max - rayOrigin) * rayInvDir)
+	local t1 = vector.max(NEG_INF_VEC, (((min - rayOrigin) * rayInvDir) :: unknown) :: vector)
+	local t2 = vector.min(POS_INF_VEC, (((max - rayOrigin) * rayInvDir) :: unknown) :: vector)
 
 	local tMin = vector.min(t1, t2)
 	local tMax = vector.max(t1, t2)
 
-	local tmin = math.max(0, tMin.X, tMin.Y, tMin.Z)
-	local tmax = math.min(maxFraction, tMax.X, tMax.Y, tMax.Z)
+	local tmin = math.max(0, tMin.x, tMin.y, tMin.z)
+	local tmax = math.min(maxFraction, tMax.x, tMax.y, tMax.z)
 
 	return tmin <= tmax
 end
@@ -52,14 +55,14 @@ end
 -- Bolt's identity: sweeping a shape along a segment against a box is the same as expanding the
 -- box by the shape's half extents and casting a ray from the shape's center through it.
 local function sweptAABB(castOrigin: Vector3, castExtents: Vector3, rayInvDir: Vector3, min: Vector3, max: Vector3, maxFraction: number): boolean
-	local t1 = vector.max(NEG_INF_VEC, (min - castExtents - castOrigin) * rayInvDir)
-	local t2 = vector.min(POS_INF_VEC, (max + castExtents - castOrigin) * rayInvDir)
+	local t1 = vector.max(NEG_INF_VEC, (((min - castExtents - castOrigin) * rayInvDir) :: unknown) :: vector)
+	local t2 = vector.min(POS_INF_VEC, (((max + castExtents - castOrigin) * rayInvDir) :: unknown) :: vector)
 
 	local tMin = vector.min(t1, t2)
 	local tMax = vector.max(t1, t2)
 
-	local tmin = math.max(0, tMin.X, tMin.Y, tMin.Z)
-	local tmax = math.min(maxFraction, tMax.X, tMax.Y, tMax.Z)
+	local tmin = math.max(0, tMin.x, tMin.y, tMin.z)
+	local tmax = math.min(maxFraction, tMax.x, tMax.y, tMax.z)
 
 	return tmin <= tmax
 end
@@ -74,31 +77,35 @@ end
 -- over-estimates: a too-large box costs a candidate that survives to the exact test, a too-small
 -- one would silently drop a real hit. Returns nil for a shape this doesn't know how to bound,
 -- which disables the pre-filter for that query rather than guessing.
+local function absVec(v: Vector3): Vector3
+	return (vector.abs((v :: unknown) :: vector) :: unknown) :: Vector3
+end
+
 local function castExtents(cframe: CFrame, shape: bolt.Shape): Vector3?
 	local shapeType = shape.type
 	local extents: Vector3
 
 	if shapeType == shapeMap.SPHERE then
-		extents = vector.one * (shape :: bolt.SphereShape).radius
+		extents = Vector3.one * (shape :: bolt.SphereShape).radius
 	elseif shapeType == shapeMap.CAPSULE or shapeType == shapeMap.CYLINDER then
 		--both are a radius swept around a RightVector-aligned axis; a cylinder is contained by
 		--the capsule with the same radius and half height, so one branch bounds both
 		local swept = shape :: bolt.CapsuleShape
-		extents = vector.abs(cframe.RightVector) * swept.half_height + vector.one * swept.radius
+		extents = absVec(cframe.RightVector) * swept.half_height + Vector3.one * swept.radius
 	elseif shapeType == shapeMap.HULL then
 		--the one shape carrying no half_extents; its scaled original bounds it
 		local hull = shape :: bolt.HullShape
 		local h = hull.original_half_extents * hull.scale
-		extents = vector.abs(cframe.RightVector) * h.X
-			+ vector.abs(cframe.UpVector) * h.Y
-			+ vector.abs(cframe.LookVector) * h.Z
+		extents = absVec(cframe.RightVector) * h.X
+			+ absVec(cframe.UpVector) * h.Y
+			+ absVec(cframe.LookVector) * h.Z
 	elseif shapeType == shapeMap.BOX or shapeType == shapeMap.ELLIPSOID
 		or shapeType == shapeMap.WEDGE or shapeType == shapeMap.CORNER_WEDGE then
 		--exact for BOX; the other three are strictly contained by the box half_extents describes
 		local h = (shape :: bolt.BoxShape).half_extents
-		extents = vector.abs(cframe.RightVector) * h.X
-			+ vector.abs(cframe.UpVector) * h.Y
-			+ vector.abs(cframe.LookVector) * h.Z
+		extents = absVec(cframe.RightVector) * h.X
+			+ absVec(cframe.UpVector) * h.Y
+			+ absVec(cframe.LookVector) * h.Z
 	else
 		return nil
 	end
@@ -107,7 +114,7 @@ local function castExtents(cframe: CFrame, shape: bolt.Shape): Vector3?
 	--shape_aabb applies: only a positive margin counts
 	local margin = shape.margin
 	if margin ~= nil and margin > 0 then
-		return extents + vector.one * margin
+		return extents + Vector3.one * margin
 	end
 
 	return extents
@@ -156,7 +163,7 @@ export type Hitbox = {
 	aabbMax: Vector3,
 }
 
-type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number}
+type PartInfo = UnionRegister.PartInfo
 
 local HistoricalHitboxes = {}
 HistoricalHitboxes.__index = HistoricalHitboxes

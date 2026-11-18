@@ -183,14 +183,16 @@ end
 -- where those extents are zero. The vector.max/min against the infinity constants keeps a 0 * inf
 -- NaN, on an axis the cast runs parallel to, from poisoning the comparison.
 local function sweptAABB(castCenter: Vector3, castExtents: Vector3, invDir: Vector3, min: Vector3, max: Vector3, maxFraction: number): boolean
-	local t1 = vector.max(NEG_INF_VEC, (min - castExtents - castCenter) * invDir)
-	local t2 = vector.min(POS_INF_VEC, (max + castExtents - castCenter) * invDir)
+	-- Vector3 and `vector` are the same value at runtime but unrelated types to the checker; the
+	-- casts go through unknown so the vector.max/min calls keep their fastcall.
+	local t1 = vector.max(NEG_INF_VEC, (((min - castExtents - castCenter) * invDir) :: unknown) :: vector)
+	local t2 = vector.min(POS_INF_VEC, (((max + castExtents - castCenter) * invDir) :: unknown) :: vector)
 
 	local tMin = vector.min(t1, t2)
 	local tMax = vector.max(t1, t2)
 
-	local tmin = math.max(0, tMin.X, tMin.Y, tMin.Z)
-	local tmax = math.min(maxFraction, tMax.X, tMax.Y, tMax.Z)
+	local tmin = math.max(0, tMin.x, tMin.y, tMin.z)
+	local tmax = math.min(maxFraction, tMax.x, tMax.y, tMax.z)
 
 	return tmin <= tmax
 end

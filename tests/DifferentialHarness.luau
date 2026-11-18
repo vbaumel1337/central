@@ -37,11 +37,8 @@ local function near(a: number, b: number, eps: number): boolean
 end
 
 local function vnear(a: Vector3?, b: Vector3?, eps: number): boolean
-	if a == nil and b == nil then
-		return true
-	end
 	if a == nil or b == nil then
-		return false
+		return a == b -- both nil is a match, exactly one nil is not
 	end
 	return (a - b).Magnitude <= eps
 end

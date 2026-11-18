@@ -19,7 +19,9 @@ local PREDICTION_CLAMP_MULTIPLE = 4
 -- very first present frame always takes the "rotation" (seed) branch, with no prior sweep to predict from
 local NO_BLOCK = 0
 
-type PartInfo = {id: number, register: PartRegister.PartRegister}
+-- Shared with HistoricalHitboxesUnion, which owns the list: {PartInfo} is invariant, so both sides
+-- have to name the one type rather than each declaring a structurally similar one.
+export type PartInfo = {id: number, part: BasePart, register: PartRegister.PartRegister, listIndex: number}
 
 local UnionRegister = {}
 UnionRegister.__index = UnionRegister
@@ -53,7 +55,10 @@ export type UnionRegister = typeof(setmetatable(
 
 local function clampPred(delta: Vector3, size: Vector3): Vector3
 	local limit = size * PREDICTION_CLAMP_MULTIPLE
-	return vector.max(vector.min(delta, limit), -limit)
+	-- Vector3 and `vector` are the same value at runtime but unrelated types to the checker; the
+	-- casts go through unknown so the vector.max/min calls keep their fastcall.
+	local d, l = (delta :: unknown) :: vector, (limit :: unknown) :: vector
+	return (vector.max(vector.min(d, l), -l) :: unknown) :: Vector3
 end
 
 -- the two-op vector idiom Bolt's own aabb_contains uses: does [envMin,envMax] contain [min,max]
@@ -187,9 +192,13 @@ function UnionRegister.UpdateFrame(self: UnionRegister, frame: number, block: nu
 		-- OBB -> world AABB, once per part per frame. Same math as Bolt's unmargined_shape_aabb
 		-- BOX branch; the result doubles as the tight per-frame cache the query path reads.
 		local cf: CFrame, h = data.cframe, data.size * 0.5
-		local e = vector.abs(cf.RightVector) * h.X
-			+ vector.abs(cf.UpVector) * h.Y
-			+ vector.abs(cf.LookVector) * h.Z
+		-- (Vector3 <-> vector casts go through unknown: same value at runtime, unrelated types to
+		-- the checker, and unlike `:: any` they keep the vector.* calls fastcall-able.)
+		local e = ((
+			vector.abs((cf.RightVector :: unknown) :: vector) * h.X
+			+ vector.abs((cf.UpVector :: unknown) :: vector) * h.Y
+			+ vector.abs((cf.LookVector :: unknown) :: vector) * h.Z
+		) :: unknown) :: Vector3
 		local bmin, bmax = cf.Position - e, cf.Position + e
 		data.aabbMin, data.aabbMax = bmin, bmax
 
@@ -229,8 +238,8 @@ function UnionRegister.UpdateFrame(self: UnionRegister, frame: number, block: nu
 		-- ============ GROW: containment only, no ratio ============
 		-- The envelope was sized deliberately from the prediction; shrinking it mid-block
 		-- would fight that. This path runs ~95% of the time.
-		local umin = vector.min(unionMin[id], bmin)
-		local umax = vector.max(unionMax[id], bmax)
+		local umin = (vector.min((unionMin[id] :: unknown) :: vector, (bmin :: unknown) :: vector) :: unknown) :: Vector3
+		local umax = (vector.max((unionMax[id] :: unknown) :: vector, (bmax :: unknown) :: vector) :: unknown) :: Vector3
 		unionMin[id], unionMax[id] = umin, umax
 
 		if hasLeaf and contains(envMinB[id], envMaxB[id], umin, umax) then

@@ -305,7 +305,7 @@ export type RowResult = {[Case]: {[number]: number | string}}
 local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, boxShape: any): (RowResult, {string})
 	local rows: RowResult = {}
 	local notes: {string} = {}
-	for _, case in CASES do
+	for _, case: Case in CASES do
 		rows[case] = {}
 	end
 
@@ -326,9 +326,9 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	local phases: {number}? = nil
 	local heights: {number}? = nil
 	if groupSize > 0 and deps.groupLayout == "cluster" then
-		phases, heights = {}, {}
-		local phaseList: {number} = phases
-		local heightList: {number} = heights
+		local phaseList: {number} = {}
+		local heightList: {number} = {}
+		phases, heights = phaseList, heightList
 		local anchors: {Vector3} = {}
 		for i, part in parts do
 			anchors[i] = part.Position
@@ -349,13 +349,14 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 			return nil
 		end
 		local number = (partIndex - 1) // groupSize + 1
-		local model = groupModels[number]
-		if not model then
-			model = Instance.new("Model")
-			model.Name = "Group" .. number
-			model.Parent = folder
-			groupModels[number] = model
+		local existing: Model? = groupModels[number]
+		if existing then
+			return existing
 		end
+		local model = Instance.new("Model")
+		model.Name = "Group" .. number
+		model.Parent = folder
+		groupModels[number] = model
 		return model
 	end
 
@@ -420,7 +421,7 @@ local function runRow(adapter: Adapter, hitboxCount: number, deps: SheetDeps, bo
 	local aborted: {[Case]: boolean} = {}
 
 	for _, queryCount in deps.queryCounts do
-		for _, case in CASES do
+		for _, case: Case in CASES do
 			if aborted[case] then
 				rows[case][queryCount] = "over"
 				continue
@@ -483,7 +484,7 @@ function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: S
 	for _, adapter in adapters do
 		cells[adapter.name] = {}
 		notes[adapter.name] = {}
-		for _, case in CASES do
+		for _, case: Case in CASES do
 			cells[adapter.name][case] = {}
 		end
 	end
@@ -491,7 +492,7 @@ function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: S
 	for _, hitboxCount in deps.hitboxCounts do
 		for _, adapter in adapters do
 			local row, rowNotes = runRow(adapter, hitboxCount, deps, boxShape)
-			for _, case in CASES do
+			for _, case: Case in CASES do
 				cells[adapter.name][case][hitboxCount] = row[case]
 			end
 			for _, n in rowNotes do
@@ -510,7 +511,7 @@ function Benchmark.RunSheets(adapters: {Adapter}, deps: SheetDeps): {[string]: S
 	local result: {[string]: SheetSet} = {}
 	for _, adapter in adapters do
 		local sheets: {Sheet} = {}
-		for _, case in CASES do
+		for _, case: Case in CASES do
 			table.insert(sheets, {
 				adapterName = adapter.name,
 				queryKind = kindOf[case],
